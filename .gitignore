@@ -1,0 +1,4 @@
+__pycache__/
+data/raw_clips/
+models/
+reports/*.npz
