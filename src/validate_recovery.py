@@ -24,7 +24,8 @@ import matplotlib.pyplot as plt
 from src.physics import simulate
 from src.synthetic import GOAL_HALF_WIDTH, GOAL_HEIGHT, broadcast_camera, generate_track
 from src.fitting import (RAD_TO_RPM, QUANTITY_NAMES, bootstrap_flight,
-                         fit_flight, flight_quantities)
+                         fit_flight, flight_quantities, reprojection_rms,
+                         spin_correction)
 
 # ground truth: right-footed curler from the left side, ~25 m/s, heavy sidespin
 P0_TRUE = np.array([-7.0, 23.0, 0.11])
@@ -84,10 +85,15 @@ def main():
     # step 3: shipped intervals
     intervals, samples = bootstrap_flight(track["times"], track["uv_noisy"],
                                           camera, theta, box=box, seed=SEED)
+    rms = reprojection_rms(theta, p0, track["times"], track["uv_noisy"], camera)
+    bias, _ = spin_correction(rms)
     q_true, q_fit = flight_quantities(truth6), flight_quantities(theta)
+    q_fit[3] -= bias  # debiased w_perp, matching the interval's recentring
+    print(f"\n    measured rms {rms:.2f} px -> w_perp debias {-bias:+.0f} rpm")
     print(f"\n{'quantity':<18}{'true':>10}{'recovered':>12}{'68% interval':>20}")
     for i, name in enumerate(QUANTITY_NAMES):
-        note = "  (unobservable)" if name.startswith("w_par") else ""
+        note = ("  (debiased)" if i == 3 else
+                "  (unobservable)" if i == 4 else "")
         print(f"{name:<18}{q_true[i]:>10.2f}{q_fit[i]:>12.2f}"
               f"{f'[{intervals[i, 0]:.2f}, {intervals[i, 1]:.2f}]':>20}{note}")
 

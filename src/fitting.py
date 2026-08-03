@@ -25,17 +25,31 @@ DEFAULT_GUESS6 = np.array([0.0, -23.0, 6.0, 0.0, 0.0, 0.0])
 
 ENDPOINT_HINGE_WEIGHT = 0.05  # m, hinge stiffness outside the crossing box
 
-# Percentile-bootstrap intervals for spin are overconfident (true 68%
-# coverage ~25%): the estimator shrinks spin toward zero and the bootstrap
-# recentres on the already-biased estimate, so added variance cannot fix it.
-# Inflating the spin interval half-width by 1.5 restores nominal coverage.
-# Calibrated on synthetic ground truth at 2 px / 25 fps / 0.3 m crossing box
-# (experiment_endpoint_stress); re-check if noise or geometry changes.
+# Spin correction, keyed by each fit's own measured reprojection RMS.
+# The estimator shrinks w_perp toward zero as tracking noise grows, and a
+# bootstrap recentres on the biased estimate, so intervals fail by BIAS,
+# not width: after recentring by b(rms), near-nominal coverage needs almost
+# no inflation. Tables from experiment_spin_calibration (80 realizations
+# per level, 25 fps, 0.3 m crossing box measured to 0.2 m); linear
+# interpolation between levels, clamped at the ends. Re-calibrate if frame
+# rate, camera geometry, or the constraint config changes materially.
+SPIN_CAL_RMS = np.array([0.49, 0.96, 1.87, 2.86, 4.85])
+SPIN_CAL_BIAS = np.array([-1.3, -24.8, -57.6, -194.8, -290.0])   # rpm
+SPIN_CAL_INFLATION = np.array([1.10, 1.00, 1.00, 1.00, 1.15])
+
+# w_par is unobservable; its interval keeps the legacy constant inflation.
 SPIN_INTERVAL_INFLATION = 1.5
 
 QUANTITY_NAMES = ["speed [m/s]", "elevation [deg]", "azimuth [deg]",
                   "w_perp [rpm]", "w_par [rpm]"]
-SPIN_ROWS = [3, 4]  # rows of QUANTITY_NAMES that get the inflation
+SPIN_ROWS = [3, 4]
+
+
+def spin_correction(rms):
+    """(bias_rpm, inflation) for the w_perp interval at a measured
+    reprojection RMS. Corrected quantity: estimate - bias."""
+    return (float(np.interp(rms, SPIN_CAL_RMS, SPIN_CAL_BIAS)),
+            float(np.interp(rms, SPIN_CAL_RMS, SPIN_CAL_INFLATION)))
 
 
 def launch_point(uv0, camera, z0=RADIUS):
@@ -85,6 +99,13 @@ def fit_flight(times, uv_obs, camera, box=None, noise_px=2.0, guess=None):
     return result.x, p0, result
 
 
+def reprojection_rms(theta6, p0, times, uv_obs, camera):
+    """Measured tracking-noise proxy: component-wise rms pixel residual of
+    the fitted flight against the observed track. Keys the spin correction."""
+    uv = camera.project(simulate(p0, theta6[:3], theta6[3:], times))
+    return float(np.sqrt(np.mean((uv - uv_obs) ** 2)))
+
+
 def flight_quantities(theta6):
     """speed, elevation, azimuth (vs straight-at-goal -y), and spin
     decomposed about the instantaneous launch velocity direction v0/|v0|:
@@ -112,8 +133,10 @@ def bootstrap_flight(times, uv_obs, camera, theta6, box=None, noise_px=2.0,
     Synthetic tracks are generated from the fitted trajectory plus fresh
     pixel noise and refit with the same procedure (same box). Returns
     (intervals, samples): intervals is (5, 2) of [lo, hi] per quantity in
-    QUANTITY_NAMES with spin rows inflated by SPIN_INTERVAL_INFLATION;
-    samples is a list of (theta6, p0) bootstrap fits for rendering fans.
+    QUANTITY_NAMES. The w_perp row is recentred by -b(rms) and inflated by
+    k(rms) from the fit's own measured reprojection RMS (spin_correction);
+    the unobservable w_par row keeps the constant inflation. samples is a
+    list of (theta6, p0) bootstrap fits for rendering fans.
     """
     p0 = launch_point(uv_obs[0], camera)
     uv_clean = camera.project(simulate(p0, theta6[:3], theta6[3:], times))
@@ -128,7 +151,11 @@ def bootstrap_flight(times, uv_obs, camera, theta6, box=None, noise_px=2.0,
     q = np.array([flight_quantities(th) for th, _ in samples])
     lo, hi = np.percentile(q, [16, 84], axis=0)
     centre, half = 0.5 * (lo + hi), 0.5 * (hi - lo)
-    half[SPIN_ROWS] *= SPIN_INTERVAL_INFLATION
+    bias, inflation = spin_correction(reprojection_rms(theta6, p0, times,
+                                                       uv_obs, camera))
+    centre[3] -= bias
+    half[3] *= inflation
+    half[4] *= SPIN_INTERVAL_INFLATION
     return np.stack([centre - half, centre + half], axis=1), samples
 
 
