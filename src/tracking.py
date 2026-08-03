@@ -20,6 +20,20 @@ MODEL_CHECKPOINT = "models/sam2.1_hiera_small.pt"
 MODEL_CONFIG = "configs/sam2.1/sam2.1_hiera_s.yaml"
 
 
+def extract_frames(video_path):
+    """Dump a clip to the JPEG-per-frame directory SAM 2 reads natively
+    (its mp4 loader needs decord, which has no Apple Silicon wheel)."""
+    import subprocess
+
+    frames_dir = os.path.splitext(video_path)[0] + "_frames"
+    if not os.path.isdir(frames_dir) or not os.listdir(frames_dir):
+        os.makedirs(frames_dir, exist_ok=True)
+        subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", video_path,
+                        "-q:v", "2", "-start_number", "0",
+                        os.path.join(frames_dir, "%d.jpg")], check=True)
+    return frames_dir
+
+
 def track_video(video_path, click_uv, click_frame=0):
     """Propagate a single click on the ball through the whole clip.
     Returns rows of (frame_idx, u, v, mask_area_px, ok)."""
@@ -29,7 +43,7 @@ def track_video(video_path, click_uv, click_frame=0):
     device = "mps" if torch.backends.mps.is_available() else "cpu"
     predictor = build_sam2_video_predictor(MODEL_CONFIG, MODEL_CHECKPOINT,
                                            device=device)
-    state = predictor.init_state(video_path)
+    state = predictor.init_state(extract_frames(video_path))
     predictor.add_new_points_or_box(
         state, frame_idx=click_frame, obj_id=1,
         points=np.array([click_uv], dtype=np.float32),
@@ -44,7 +58,15 @@ def track_video(video_path, click_uv, click_frame=0):
         else:
             rows.append((frame_idx, float(xs.mean()), float(ys.mean()),
                          int(len(xs)), 1))
-    return sorted(rows)
+    rows = sorted(rows)
+
+    # a ball mask is a few hundred px; a huge one means the click missed
+    # the ball and SAM grabbed pitch/crowd — flag it loudly
+    areas = sorted(r[3] for r in rows if r[4])
+    if areas and areas[len(areas) // 2] > 10000:
+        print(f"WARNING: median mask area {areas[len(areas) // 2]} px — "
+              f"seed click likely missed the ball; re-check the click point")
+    return rows
 
 
 def save_track(rows, out_path):

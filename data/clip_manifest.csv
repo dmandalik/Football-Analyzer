@@ -1,1 +1,4 @@
 clip_id,player,source_url,start_s,end_s,fps,grade,viewing_angle_est,notes
+messi_liverpool_2019,Messi,https://www.youtube.com/watch?v=9mlybuNYGtE,18.0,21.5,25,usable,diagonal 25-40deg (est),replay; camera pans; 86/88 frames; jitter 5-7px; goal enters frame mid-flight
+ronaldo_spain_2018,Ronaldo,https://www.youtube.com/watch?v=1EmAwblXnIY,3.2,6.2,50,usable,side-diagonal 50-70deg (est),static main cam; pitch+goal in frame; flight fully tracked; jitter 1.5px cross-track 5px along-track; losses only post-goal
+calhanoglu_dortmund_2014,Calhanoglu,https://www.youtube.com/watch?v=nK58AssP9tc,42.4,48.4,25,usable-caveat,diagonal (est),slow-motion replay ~2x - time scale must be estimated in fitting; 149/150 frames; jitter ~5.9px; live kick at t=5-9 is true-time alternative

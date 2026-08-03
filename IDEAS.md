@@ -12,3 +12,6 @@
   check instead of a correction.
 - Keeper reachability envelope parameterized by reaction time and dive
   speed distributions from the literature, not single point values.
+- Ball centroid refinement: fit a circle/ellipse to the SAM 2 mask (or
+  deconvolve blur elongation) instead of raw centroid; crop + upscale the
+  flight region for small balls. Along-track jitter is 3-4x cross-track.
