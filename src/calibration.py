@@ -122,6 +122,23 @@ def to_project_camera(params, goal):
     return Camera(K, R_ours, C_ours)
 
 
+def compose_to_reference(camera, H):
+    """Express a frame-f* calibration in REFERENCE coordinates, given the
+    stabilization homography H mapping reference pixels -> frame-f* pixels
+    (stabilize.py convention): P_ref = H^-1 P_f*, re-decomposed into a
+    pinhole Camera via RQ."""
+    from scipy.linalg import rq
+
+    P = camera.K @ camera.R @ np.hstack([np.eye(3), -camera.C[:, None]])
+    P_ref = np.linalg.inv(H) @ P
+    M = P_ref[:, :3]
+    K, R = rq(M)
+    T = np.diag(np.sign(np.diag(K)))
+    K, R = K @ T, T @ R
+    C = -np.linalg.inv(M) @ P_ref[:, 3]
+    return Camera(K / K[2, 2], R, C)
+
+
 def render_pitch_overlay(image_path, camera, out_path):
     """Project our-frame pitch model onto the frame. Wrong calibration puts
     lines in the stands — always look."""
