@@ -87,8 +87,12 @@ def crossing_hinge(p0, v0, omega, box):
     return np.array([ex, ez]) / ENDPOINT_HINGE_WEIGHT
 
 
+SLOMO_BOUNDS = (1.0, 6.0)
+SLOMO_GUESS = 2.5
+
+
 def fit_flight(times, uv_obs, camera, box=None, noise_px=None, noise=None,
-               guess=None):
+               guess=None, slomo=False):
     """Fit launch velocity and spin to a pixel track.
 
     Whitening (default): residuals are rotated per-frame into the local
@@ -100,7 +104,12 @@ def fit_flight(times, uv_obs, camera, box=None, noise_px=None, noise=None,
     box: optional (cx, cz, half_width) goal-plane crossing measurement.
     Set half_width no tighter than the crossing measurement's real accuracy
     — a mis-centred tight box produces confident wrong answers.
-    Returns (theta6, p0, result).
+
+    slomo=True appends the slow-motion factor s as a 7th parameter: the
+    observed timestamps are s times slower than true time, so the physics
+    runs on times/s. Identifiable because apparent gravity (g/s^2) is
+    measured directly by image curvature over the arc.
+    Returns (theta, p0, result) — theta has 7 entries when slomo.
     """
     p0 = launch_point(uv_obs[0], camera)
     if noise_px is None:
@@ -108,9 +117,10 @@ def fit_flight(times, uv_obs, camera, box=None, noise_px=None, noise=None,
         if noise is not None:
             sc, sa = max(SIGMA_FLOOR, noise[0]), max(SIGMA_FLOOR, noise[1])
 
-    def f(theta6):
-        v0, omega = theta6[:3], theta6[3:]
-        uv = camera.project(simulate(p0, v0, omega, times))
+    def f(theta):
+        v0, omega = theta[:3], theta[3:6]
+        t_true = times / theta[6] if slomo else times
+        uv = camera.project(simulate(p0, v0, omega, t_true))
         d = uv - uv_obs
         if noise_px is None:
             r = np.concatenate([np.sum(d * n_hat, axis=1) / sc,
@@ -121,8 +131,15 @@ def fit_flight(times, uv_obs, camera, box=None, noise_px=None, noise=None,
             r = np.concatenate([r, crossing_hinge(p0, v0, omega, box)])
         return r
 
-    result = least_squares(f, DEFAULT_GUESS6 if guess is None else guess,
-                           bounds=(LOWER6, UPPER6), method="trf", x_scale="jac")
+    if slomo:
+        lower = np.append(LOWER6, SLOMO_BOUNDS[0])
+        upper = np.append(UPPER6, SLOMO_BOUNDS[1])
+        g0 = np.append(DEFAULT_GUESS6, SLOMO_GUESS) if guess is None else guess
+    else:
+        lower, upper = LOWER6, UPPER6
+        g0 = DEFAULT_GUESS6 if guess is None else guess
+    result = least_squares(f, g0, bounds=(lower, upper), method="trf",
+                           x_scale="jac")
     return result.x, p0, result
 
 
@@ -213,7 +230,7 @@ def flight_quantities(theta6):
 
 
 def bootstrap_flight(times, uv_obs, camera, theta6, box=None, noise_px=None,
-                     n_boot=19, seed=0):
+                     n_boot=19, seed=0, slomo=False):
     """Parametric percentile bootstrap around a fitted flight.
 
     Synthetic tracks are generated from the fitted trajectory plus fresh
@@ -225,22 +242,27 @@ def bootstrap_flight(times, uv_obs, camera, theta6, box=None, noise_px=None,
     list of (theta6, p0) bootstrap fits for rendering fans.
     """
     p0 = launch_point(uv_obs[0], camera)
-    uv_clean = camera.project(simulate(p0, theta6[:3], theta6[3:], times))
-    rms_cross, rms_along = residual_decomposition(theta6, p0, times, uv_obs,
-                                                  camera)
+    t_true = times / theta6[6] if slomo else times
+    uv_clean = camera.project(simulate(p0, theta6[:3], theta6[3:6], t_true))
+    rms_cross, rms_along = residual_decomposition(theta6[:6], p0, t_true,
+                                                  uv_obs, camera)
     # fit residuals understate the true noise because the fit absorbs part
-    # of it; standard dof inflation (p=6 parameters over n frames)
-    dof_inflation = np.sqrt(len(times) / max(1.0, len(times) - 6.0))
+    # of it; standard dof inflation (p parameters over n frames)
+    p_dim = 7 if slomo else 6
+    dof_inflation = np.sqrt(len(times) / max(1.0, len(times) - p_dim))
     rng = np.random.default_rng(seed)
     samples = []
     for _ in range(n_boot):
         uv = anisotropic_noise(uv_clean, rms_cross * dof_inflation,
                                rms_along * dof_inflation, rng)
-        th, p0_b, res = fit_flight(times, uv, camera, box=box, noise_px=noise_px)
+        th, p0_b, res = fit_flight(times, uv, camera, box=box,
+                                   noise_px=noise_px, slomo=slomo)
         if res.status > 0:
             samples.append((th, p0_b))
 
-    q = np.array([flight_quantities(th) for th, _ in samples])
+    q = np.array([flight_quantities(th[:6]) for th, _ in samples])
+    if slomo:  # 6th row: the slow-motion factor's own interval
+        q = np.hstack([q, np.array([[th[6]] for th, _ in samples])])
     lo, hi = np.percentile(q, [16, 84], axis=0)
     centre, half = 0.5 * (lo + hi), 0.5 * (hi - lo)
     bias, inflation = spin_correction(rms_cross)

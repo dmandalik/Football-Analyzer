@@ -72,6 +72,12 @@ def main():
     ap.add_argument("--half", type=float, default=0.5,
                     help="crossing box half-width [m], conservative")
     ap.add_argument("--n-boot", type=int, default=40)
+    ap.add_argument("--slomo", action="store_true",
+                    help="fit the slow-motion factor as a 7th parameter")
+    ap.add_argument("--noise", type=float, nargs=2, default=None,
+                    metavar=("CROSS", "ALONG"),
+                    help="override whitening sigmas, e.g. to fold in "
+                         "stabilization error")
     args = ap.parse_args()
 
     camera = load_camera(args.calib)
@@ -87,8 +93,11 @@ def main():
     print(f"measured crossing: x={cx:+.2f}, z={cz:.2f} m +/- {args.half} "
           f"({'inside' if in_goal else 'OUTSIDE'} the goal mouth)")
 
-    theta, p0, res = fit_flight(times, uv, camera, box=box)
-    rms_cross, rms_along = residual_decomposition(theta, p0, times, uv, camera)
+    theta, p0, res = fit_flight(times, uv, camera, box=box, noise=args.noise,
+                                slomo=args.slomo)
+    t_true = times / theta[6] if args.slomo else times
+    rms_cross, rms_along = residual_decomposition(theta[:6], p0, t_true, uv,
+                                                  camera)
     print(f"fit: status {res.status}, nfev {res.nfev}; residuals "
           f"cross {rms_cross:.2f} px, along {rms_along:.2f} px "
           f"(ratio {rms_along / rms_cross:.1f})")
@@ -96,9 +105,10 @@ def main():
           f"{p0[2]:.2f}) m -> {np.hypot(p0[0], p0[1]):.1f} m out")
 
     intervals, samples = bootstrap_flight(times, uv, camera, theta, box=box,
-                                          n_boot=args.n_boot, seed=0)
+                                          n_boot=args.n_boot, seed=0,
+                                          slomo=args.slomo)
     bias, _ = spin_correction(rms_cross)
-    q = flight_quantities(theta)
+    q = flight_quantities(theta[:6])
     q[3] -= bias
     print(f"\n{'quantity':<18}{'estimate':>10}{'68% interval':>20}")
     for i, name in enumerate(QUANTITY_NAMES):
@@ -106,8 +116,12 @@ def main():
                 "  (UNOBSERVABLE)" if i == 4 else "")
         print(f"{name:<18}{q[i]:>10.2f}"
               f"{f'[{intervals[i, 0]:.2f}, {intervals[i, 1]:.2f}]':>20}{note}")
+    if args.slomo:
+        print(f"{'slow-mo factor s':<18}{theta[6]:>10.2f}"
+              f"{f'[{intervals[5, 0]:.2f}, {intervals[5, 1]:.2f}]':>20}"
+              f"  (broadcast multiples: 2, 2.5, 3)")
 
-    fc = fitted_crossing(theta, p0)
+    fc = fitted_crossing(theta[:6], p0)
     if fc:
         miss = np.hypot(fc[0] - cx, fc[1] - cz)
         print(f"\ngoal-mouth check: fitted crossing x={fc[0]:+.2f}, z={fc[1]:.2f} "
