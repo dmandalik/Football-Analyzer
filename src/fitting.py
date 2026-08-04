@@ -13,6 +13,7 @@ Model, as validated by the Phase 0 synthetic experiments:
 
 import numpy as np
 from scipy.optimize import least_squares
+from scipy.signal import savgol_filter
 
 from src.physics import RADIUS, simulate
 
@@ -25,17 +26,27 @@ DEFAULT_GUESS6 = np.array([0.0, -23.0, 6.0, 0.0, 0.0, 0.0])
 
 ENDPOINT_HINGE_WEIGHT = 0.05  # m, hinge stiffness outside the crossing box
 
-# Spin correction, keyed by each fit's own measured reprojection RMS.
-# The estimator shrinks w_perp toward zero as tracking noise grows, and a
-# bootstrap recentres on the biased estimate, so intervals fail by BIAS,
-# not width: after recentring by b(rms), near-nominal coverage needs almost
-# no inflation. Tables from experiment_spin_calibration (80 realizations
-# per level, 25 fps, 0.3 m crossing box measured to 0.2 m); linear
-# interpolation between levels, clamped at the ends. Re-calibrate if frame
-# rate, camera geometry, or the constraint config changes materially.
-SPIN_CAL_RMS = np.array([0.49, 0.96, 1.87, 2.86, 4.85])
-SPIN_CAL_BIAS = np.array([-1.3, -24.8, -57.6, -194.8, -290.0])   # rpm
-SPIN_CAL_INFLATION = np.array([1.10, 1.00, 1.00, 1.00, 1.15])
+# Spin correction, keyed by each fit's measured CROSS-TRACK residual RMS.
+# Real tracking noise is anisotropic — blur smears the ball centroid along
+# its travel direction 3-11x more than across it — and curvature (spin)
+# information lives cross-track, so that is the axis that gates spin. The
+# estimator shrinks w_perp toward zero as noise grows and a bootstrap
+# recentres on the biased estimate, so intervals fail by BIAS, not width:
+# after recentring by b(rms_cross), near-nominal coverage needs little
+# inflation. Tables from experiment_spin_calibration (anisotropic noise,
+# along/cross ratio 4, 80 realizations per level, 25 fps, 0.3 m crossing
+# box measured to 0.2 m); linear interpolation, clamped at the ends.
+# Re-calibrate if frame rate, geometry, or constraint config changes.
+# NOTE: this table was derived under legacy SCALAR whitening. Under the
+# anisotropic-whitening default the ratio dependence disappears and the
+# bias shrinks (clipmatch recheck: -86 rpm at ratio 4 vs -58 at ratio 10,
+# statistically indistinguishable; scalar had -95 vs -250) — the table is
+# approximately right near 1.5-2 px cross-track but should be re-derived
+# under whitening. For fit-grade clips, prefer a clip-matched calibration
+# at the clip's own measured (cross, along) noise; table is for grading.
+SPIN_CAL_RMS = np.array([0.51, 1.01, 1.60, 2.10, 3.00])
+SPIN_CAL_BIAS = np.array([6.6, -165.3, -95.3, -151.2, -94.4])    # rpm
+SPIN_CAL_INFLATION = np.array([1.25, 1.65, 1.45, 1.05, 1.55])
 
 # w_par is unobservable; its interval keeps the legacy constant inflation.
 SPIN_INTERVAL_INFLATION = 1.5
@@ -76,8 +87,15 @@ def crossing_hinge(p0, v0, omega, box):
     return np.array([ex, ez]) / ENDPOINT_HINGE_WEIGHT
 
 
-def fit_flight(times, uv_obs, camera, box=None, noise_px=2.0, guess=None):
+def fit_flight(times, uv_obs, camera, box=None, noise_px=None, noise=None,
+               guess=None):
     """Fit launch velocity and spin to a pixel track.
+
+    Whitening (default): residuals are rotated per-frame into the local
+    track frame — axes fixed from the SG-smoothed observed track, see
+    estimate_track_noise — and scaled by 1/sigma_cross, 1/sigma_along.
+    Pass noise=(sigma_cross, sigma_along) to override the estimated
+    sigmas, or noise_px=<scalar> for legacy isotropic whitening.
 
     box: optional (cx, cz, half_width) goal-plane crossing measurement.
     Set half_width no tighter than the crossing measurement's real accuracy
@@ -85,11 +103,20 @@ def fit_flight(times, uv_obs, camera, box=None, noise_px=2.0, guess=None):
     Returns (theta6, p0, result).
     """
     p0 = launch_point(uv_obs[0], camera)
+    if noise_px is None:
+        sc, sa, t_hat, n_hat = estimate_track_noise(uv_obs)
+        if noise is not None:
+            sc, sa = max(SIGMA_FLOOR, noise[0]), max(SIGMA_FLOOR, noise[1])
 
     def f(theta6):
         v0, omega = theta6[:3], theta6[3:]
         uv = camera.project(simulate(p0, v0, omega, times))
-        r = ((uv - uv_obs) / noise_px).ravel()
+        d = uv - uv_obs
+        if noise_px is None:
+            r = np.concatenate([np.sum(d * n_hat, axis=1) / sc,
+                                np.sum(d * t_hat, axis=1) / sa])
+        else:
+            r = (d / noise_px).ravel()
         if box is not None:
             r = np.concatenate([r, crossing_hinge(p0, v0, omega, box)])
         return r
@@ -100,10 +127,69 @@ def fit_flight(times, uv_obs, camera, box=None, noise_px=2.0, guess=None):
 
 
 def reprojection_rms(theta6, p0, times, uv_obs, camera):
-    """Measured tracking-noise proxy: component-wise rms pixel residual of
-    the fitted flight against the observed track. Keys the spin correction."""
+    """Component-wise rms pixel residual of the fitted flight against the
+    observed track (isotropic total; see residual_decomposition)."""
     uv = camera.project(simulate(p0, theta6[:3], theta6[3:], times))
     return float(np.sqrt(np.mean((uv - uv_obs) ** 2)))
+
+
+def track_frame_axes(uv):
+    """Per-frame unit tangent and normal of a pixel track."""
+    vel = np.gradient(np.asarray(uv, dtype=float), axis=0)
+    speed = np.maximum(np.linalg.norm(vel, axis=1, keepdims=True), 1e-9)
+    t_hat = vel / speed
+    n_hat = np.stack([-t_hat[:, 1], t_hat[:, 0]], axis=1)
+    return t_hat, n_hat
+
+
+def residual_decomposition(theta6, p0, times, uv_obs, camera):
+    """(rms_cross, rms_along): pixel residuals split normal/tangent to the
+    modeled track. Real tracking noise is anisotropic (blur smears the ball
+    along its travel direction), and curvature information lives cross-track,
+    so rms_cross is what keys the spin correction and clip grading."""
+    uv = camera.project(simulate(p0, theta6[:3], theta6[3:], times))
+    t_hat, n_hat = track_frame_axes(uv)
+    r = uv_obs - uv
+    return (float(np.sqrt(np.mean(np.sum(r * n_hat, axis=1) ** 2))),
+            float(np.sqrt(np.mean(np.sum(r * t_hat, axis=1) ** 2))))
+
+
+def anisotropic_noise(uv_clean, sigma_cross, sigma_along, rng):
+    """Gaussian pixel noise oriented along the track: sigma_along in the
+    travel direction, sigma_cross perpendicular to it."""
+    t_hat, n_hat = track_frame_axes(uv_clean)
+    n = len(uv_clean)
+    return (uv_clean
+            + t_hat * rng.normal(0.0, sigma_along, size=(n, 1))
+            + n_hat * rng.normal(0.0, sigma_cross, size=(n, 1)))
+
+
+SG_WINDOW = 9
+SIGMA_FLOOR = 0.2  # px; keeps weights finite on near-noiseless tracks
+
+
+def estimate_track_noise(uv_obs):
+    """(sigma_cross, sigma_along, t_hat, n_hat) from the observed track.
+
+    Sigmas come from Savitzky-Golay residuals (window 9, quadratic),
+    scaled by sqrt(w/(w-3)) for the dof the smooth absorbs. The per-frame
+    axes t_hat/n_hat come from the SG smooth of the OBSERVED track and are
+    HELD FIXED during fitting. Do not refactor them to come from the
+    projected model trajectory: that makes the whitening depend on the
+    parameters being fitted, so a wrong fit can rotate the noise ellipse
+    to justify its own errors.
+    """
+    uv = np.asarray(uv_obs, dtype=float)
+    win = SG_WINDOW if len(uv) >= SG_WINDOW else max(5, (len(uv) // 2) * 2 - 1)
+    smooth = savgol_filter(uv, window_length=win, polyorder=2, axis=0)
+    t_hat, n_hat = track_frame_axes(smooth)
+    r = uv - smooth
+    scale = np.sqrt(win / (win - 3.0))
+    sigma_cross = max(SIGMA_FLOOR,
+                      float(np.sqrt(np.mean(np.sum(r * n_hat, axis=1) ** 2))) * scale)
+    sigma_along = max(SIGMA_FLOOR,
+                      float(np.sqrt(np.mean(np.sum(r * t_hat, axis=1) ** 2))) * scale)
+    return sigma_cross, sigma_along, t_hat, n_hat
 
 
 def flight_quantities(theta6):
@@ -126,7 +212,7 @@ def flight_quantities(theta6):
     ])
 
 
-def bootstrap_flight(times, uv_obs, camera, theta6, box=None, noise_px=2.0,
+def bootstrap_flight(times, uv_obs, camera, theta6, box=None, noise_px=None,
                      n_boot=19, seed=0):
     """Parametric percentile bootstrap around a fitted flight.
 
@@ -140,10 +226,16 @@ def bootstrap_flight(times, uv_obs, camera, theta6, box=None, noise_px=2.0,
     """
     p0 = launch_point(uv_obs[0], camera)
     uv_clean = camera.project(simulate(p0, theta6[:3], theta6[3:], times))
+    rms_cross, rms_along = residual_decomposition(theta6, p0, times, uv_obs,
+                                                  camera)
+    # fit residuals understate the true noise because the fit absorbs part
+    # of it; standard dof inflation (p=6 parameters over n frames)
+    dof_inflation = np.sqrt(len(times) / max(1.0, len(times) - 6.0))
     rng = np.random.default_rng(seed)
     samples = []
     for _ in range(n_boot):
-        uv = uv_clean + rng.normal(0.0, noise_px, size=uv_clean.shape)
+        uv = anisotropic_noise(uv_clean, rms_cross * dof_inflation,
+                               rms_along * dof_inflation, rng)
         th, p0_b, res = fit_flight(times, uv, camera, box=box, noise_px=noise_px)
         if res.status > 0:
             samples.append((th, p0_b))
@@ -151,8 +243,7 @@ def bootstrap_flight(times, uv_obs, camera, theta6, box=None, noise_px=2.0,
     q = np.array([flight_quantities(th) for th, _ in samples])
     lo, hi = np.percentile(q, [16, 84], axis=0)
     centre, half = 0.5 * (lo + hi), 0.5 * (hi - lo)
-    bias, inflation = spin_correction(reprojection_rms(theta6, p0, times,
-                                                       uv_obs, camera))
+    bias, inflation = spin_correction(rms_cross)
     centre[3] -= bias
     half[3] *= inflation
     half[4] *= SPIN_INTERVAL_INFLATION
