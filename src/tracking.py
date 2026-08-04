@@ -62,10 +62,20 @@ def track_video(video_path, click_uv, click_frame=0):
 
     # a ball mask is a few hundred px; a huge one means the click missed
     # the ball and SAM grabbed pitch/crowd — flag it loudly
-    areas = sorted(r[3] for r in rows if r[4])
-    if areas and areas[len(areas) // 2] > 10000:
-        print(f"WARNING: median mask area {areas[len(areas) // 2]} px — "
-              f"seed click likely missed the ball; re-check the click point")
+    areas = [r[3] for r in rows if r[4]]  # chronological
+    med = sorted(areas)[len(areas) // 2] if areas else 0
+    if med > 10000:
+        print(f"WARNING: median mask area {med} px — seed click likely "
+              f"missed the ball; re-check the click point")
+    # blur legitimately swells the mask ~2-3x with speed; a lock onto a
+    # sock or pitch line survives the ceiling check but shows spikes or
+    # sustained drift far outside that envelope
+    if med:
+        spiky = sum(1 for a in areas if a > 4 * med or a < med / 4)
+        if spiky > 0.1 * len(areas):
+            print(f"WARNING: {spiky}/{len(areas)} frames have mask area "
+                  f">4x or <1/4x the median — mask is unstable; verify the "
+                  f"overlay before trusting this track")
     return rows
 
 
