@@ -149,7 +149,11 @@ def verify():
               + f"   ({len(r)}/{N_VER})")
 
 
-CLIP_POINT = (1.6, 4.9)   # Ronaldo's measured (cross, along) noise, px
+# NOTE: (1.6, 4.9) was measured on a track later found to be garbage (the
+# Ronaldo camera pans; the "flight" was a divot + pan artifact). The
+# clipmatch validation therefore characterizes the solver at this
+# SYNTHETIC noise point only — it is not validated for any real clip.
+CLIP_POINT = (1.6, 4.9)
 RATIO_RECHECK = {"r4": (1.5, 6.0), "r10": (1.5, 15.0)}
 VARIANT_INDEX = {"scalar": 0, "aniso": 1, "r4": 2, "r10": 3}
 
