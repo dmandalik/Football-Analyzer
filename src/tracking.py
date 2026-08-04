@@ -133,6 +133,39 @@ def render_overlay(video_path, track_path, out_path):
     print(f"overlay written to {out_path} ({idx} frames)")
 
 
+def ballistic_check(frames, uv, fps):
+    """Physics guard for a flight track: vertical image motion must show
+    roughly constant downward curvature (gravity). Returns (ok, message).
+
+    Catches the silent failure where a 'track' follows a static spot, a
+    walking person, or camera pan — those are flat or non-curving. Run on
+    the flight window only, in stabilized coordinates if the camera moves.
+    """
+    t = (np.asarray(frames, float) - frames[0]) / fps
+    v = np.asarray(uv, float)[:, 1]
+    if len(t) < 12:
+        return False, f"only {len(t)} points — too few to verify a flight"
+    coef, res, *_ = np.polyfit(t, v, 2, full=True)
+    a = coef[0]  # px/s^2; image v grows downward, so gravity makes a > 0
+    rms = float(np.sqrt(res[0] / len(t))) if len(res) else 0.0
+    dv = v.max() - v.min()
+    if dv < 30:
+        return False, f"vertical motion only {dv:.0f} px — flat track, not a flight"
+    if a < 50:
+        return False, f"curvature {a:.0f} px/s^2 not downward-parabolic (want >>0)"
+    half = len(t) // 2
+    a1 = np.polyfit(t[:half], v[:half], 2)[0]
+    a2 = np.polyfit(t[half:], v[half:], 2)[0]
+    # both halves must curve downward; magnitude may legitimately drop
+    # several-fold as the ball recedes (pixel scale shrinks with depth),
+    # so the constancy bound is loose — the SIGN is the hard criterion
+    if not (a1 > 0 and a2 > 0 and max(a1, a2) / max(min(a1, a2), 1e-9) < 8):
+        return False, (f"curvature not roughly constant: halves "
+                       f"{a1:.0f} / {a2:.0f} px/s^2")
+    return True, (f"ballistic: curvature {a:.0f} px/s^2 (halves {a1:.0f}/"
+                  f"{a2:.0f}), v-range {dv:.0f} px, quad rms {rms:.1f} px")
+
+
 def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -144,7 +177,19 @@ def main():
     o = sub.add_parser("overlay")
     o.add_argument("video"), o.add_argument("track")
     o.add_argument("--out", default=None)
+    c = sub.add_parser("check")
+    c.add_argument("track"), c.add_argument("first", type=int)
+    c.add_argument("last", type=int)
+    c.add_argument("--fps", type=float, default=25.0)
     args = ap.parse_args()
+
+    if args.cmd == "check":
+        rows = [r for r in load_track(args.track)
+                if r[4] and args.first <= r[0] <= args.last]
+        ok, msg = ballistic_check([r[0] for r in rows],
+                                  [(r[1], r[2]) for r in rows], args.fps)
+        print(("PASS: " if ok else "FAIL: ") + msg)
+        return
 
     stem = os.path.splitext(os.path.basename(args.video))[0]
     if args.cmd == "track":
