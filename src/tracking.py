@@ -49,16 +49,21 @@ def track_video(video_path, click_uv, click_frame=0):
         points=np.array([click_uv], dtype=np.float32),
         labels=np.array([1], dtype=np.int32))
 
-    rows = []
-    for frame_idx, _, masks in predictor.propagate_in_video(state):
-        mask = (masks[0] > 0.0).cpu().numpy().squeeze()
-        ys, xs = np.nonzero(mask)
-        if len(xs) == 0:
-            rows.append((frame_idx, np.nan, np.nan, 0, 0))
-        else:
-            rows.append((frame_idx, float(xs.mean()), float(ys.mean()),
-                         int(len(xs)), 1))
-    rows = sorted(rows)
+    # propagate both directions so a mid-flight seed covers the whole clip
+    # (a pre-strike seed on a long-static ball tends to stay stuck to the
+    # kick spot when the ball launches — seed mid-flight instead)
+    by_frame = {}
+    for reverse in (False, True):
+        for frame_idx, _, masks in predictor.propagate_in_video(state,
+                                                                reverse=reverse):
+            mask = (masks[0] > 0.0).cpu().numpy().squeeze()
+            ys, xs = np.nonzero(mask)
+            if len(xs) == 0:
+                by_frame[frame_idx] = (frame_idx, np.nan, np.nan, 0, 0)
+            else:
+                by_frame[frame_idx] = (frame_idx, float(xs.mean()),
+                                       float(ys.mean()), int(len(xs)), 1)
+    rows = [by_frame[k] for k in sorted(by_frame)]
 
     # a ball mask is a few hundred px; a huge one means the click missed
     # the ball and SAM grabbed pitch/crowd — flag it loudly
