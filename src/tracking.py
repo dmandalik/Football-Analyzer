@@ -34,8 +34,12 @@ def extract_frames(video_path):
     return frames_dir
 
 
-def track_video(video_path, click_uv, click_frame=0):
-    """Propagate a single click on the ball through the whole clip.
+def track_video(video_path, click_uv, click_frame=0, extra_points=None):
+    """Propagate clicks on the ball through the whole clip. extra_points is
+    a list of (u, v, frame) anchors on OTHER frames — use them when a fast
+    blurred ball shares pixels with crisp static objects (boards, posts):
+    a single-frame seed lets SAM 2 trade the streak for the static object,
+    multi-frame anchors pin the moving one.
     Returns rows of (frame_idx, u, v, mask_area_px, ok)."""
     import torch
     from sam2.build_sam import build_sam2_video_predictor
@@ -48,6 +52,11 @@ def track_video(video_path, click_uv, click_frame=0):
         state, frame_idx=click_frame, obj_id=1,
         points=np.array([click_uv], dtype=np.float32),
         labels=np.array([1], dtype=np.int32))
+    for (u, v, f) in (extra_points or []):
+        predictor.add_new_points_or_box(
+            state, frame_idx=int(f), obj_id=1,
+            points=np.array([(u, v)], dtype=np.float32),
+            labels=np.array([1], dtype=np.int32))
 
     # propagate both directions so a mid-flight seed covers the whole clip
     # (a pre-strike seed on a long-static ball tends to stay stuck to the
@@ -173,6 +182,9 @@ def main():
     t.add_argument("video"), t.add_argument("u", type=float)
     t.add_argument("v", type=float)
     t.add_argument("--frame", type=int, default=0)
+    t.add_argument("--point", type=float, nargs=3, action="append",
+                   default=[], metavar=("U", "V", "FRAME"),
+                   help="extra ball anchor on another frame (repeatable)")
     t.add_argument("--out", default=None)
     o = sub.add_parser("overlay")
     o.add_argument("video"), o.add_argument("track")
@@ -193,7 +205,8 @@ def main():
 
     stem = os.path.splitext(os.path.basename(args.video))[0]
     if args.cmd == "track":
-        rows = track_video(args.video, (args.u, args.v), args.frame)
+        rows = track_video(args.video, (args.u, args.v), args.frame,
+                           extra_points=args.point)
         out = args.out or f"data/tracks/{stem}.csv"
         save_track(rows, out)
         ok = sum(r[4] for r in rows)
