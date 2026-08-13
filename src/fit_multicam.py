@@ -88,41 +88,188 @@ def multicam_fit(times, frames_idx, uv, cams, p0, box, noise):
                          method="trf", x_scale="jac")
 
 
+def smooth_poses(poses_path, out_path, deg=None):
+    """A gantry camera moves smoothly; frame-to-frame pose jitter is solve
+    noise that aliases into fake ball curvature (i.e. fake spin). Fit
+    polynomials to rotation and focal over time — degree chosen by how well
+    the GOAL CORNERS reproject through the smoothed poses (over-smoothing
+    deletes real pan/zoom, which is worse than the jitter it removes)."""
+    from src.goal_pnp import GOAL_3D
+
+    d = np.load(poses_path)
+    frames = d["frames"].astype(float)
+    ok = d["ok"].astype(bool)
+    rv = d["rvecs"].reshape(len(frames), 3)
+    C = d["C"]
+
+    def build(deg_try):
+        out_rv = np.stack([np.polyval(np.polyfit(frames[ok], rv[ok, c],
+                                                 deg_try), frames)
+                           for c in range(3)], axis=1)
+        fs = np.polyval(np.polyfit(frames[ok], d["fs"][ok], deg_try), frames)
+        return out_rv, fs
+
+    # corner reprojection rms through smoothed poses, ok frames only
+    side = np.sign(d["corners"][0][0][0] - d["corners"][0][2][0])  # unused
+    obj = np.array([v for v in GOAL_3D.values()])
+    # recover the x-sign the solve used by testing both against frame 0
+    def corner_rms(out_rv, fs, obj_signed):
+        errs = []
+        for k in np.where(ok)[0]:
+            R, _ = cv2.Rodrigues(out_rv[k])
+            K = np.array([[fs[k], 0, 960], [0, fs[k], 540], [0, 0, 1.0]])
+            q = (K @ (R @ (obj_signed - C).T + (-R @ C).reshape(3, 1)
+                      + (R @ C).reshape(3, 1) - (R @ C).reshape(3, 1))).T
+            q = (K @ (R @ (obj_signed - C).T)).T
+            uv = q[:, :2] / q[:, 2:]
+            errs.append(np.sqrt(np.mean((uv - d["corners"][k]) ** 2)))
+        return float(np.mean(errs))
+
+    best = None
+    for s in (1.0, -1.0):
+        obj_s = obj.copy()
+        obj_s[:, 0] *= s
+        r0 = corner_rms(rv, d["fs"], obj_s)
+        if best is None or r0 < best[1]:
+            best = (obj_s, r0)
+    obj_s, raw_rms = best
+    print(f"raw poses corner rms {raw_rms:.2f} px")
+
+    chosen = None
+    for deg_try in ([deg] if deg else [3, 4, 5, 6, 7]):
+        out_rv, fs = build(deg_try)
+        rms = corner_rms(out_rv, fs, obj_s)
+        print(f"  deg {deg_try}: corner rms {rms:.2f} px")
+        if chosen is None and rms < max(3.5, raw_rms + 1.5):
+            chosen = (deg_try, out_rv, fs, rms)
+    if chosen is None:
+        deg_try = deg or 7
+        out_rv, fs = build(deg_try)
+        chosen = (deg_try, out_rv, fs, corner_rms(out_rv, fs, obj_s))
+    deg_used, out_rv, fs, rms = chosen
+    print(f"pose smoothing: degree {deg_used}, corner rms {rms:.2f} px "
+          f"(raw {raw_rms:.2f})")
+    np.savez(out_path, K=d["K"], frames=d["frames"],
+             rvecs=out_rv.reshape(-1, 3, 1),
+             tvecs=np.stack([
+                 (-cv2.Rodrigues(out_rv[k])[0] @ (-cv2.Rodrigues(rv[k])[0].T
+                  @ d["tvecs"][k].reshape(3))).reshape(3, 1)
+                 for k in range(len(frames))]),
+             fs=fs, C=d["C"], ok=d["ok"], corners=d["corners"])
+    print(f"saved {out_path}")
+
+
+def crossing_frame_geometric(cams, rows):
+    """First frame whose ball pixel lies inside the projected goal mouth —
+    the measured crossing belongs there, not at the last tracked pixel
+    (which may already be behind the plane / in the net)."""
+    quad3 = np.array([(-3.66, 0, 0), (-3.66, 0, 2.44),
+                      (3.66, 0, 2.44), (3.66, 0, 0)])
+    for t in rows[len(rows) // 2:]:
+        quad = project_frame(cams, t[0], quad3).astype(np.float32)
+        if cv2.pointPolygonTest(quad.reshape(-1, 1, 2),
+                                (float(t[1]), float(t[2])), False) >= 0:
+            return t
+    return rows[-1]
+
+
+def refined_centers(track_path, first, last):
+    """Pick the steadiest center definition per track: mask centroid vs
+    principal-axis midpoint (streak endpoints are stabler when the mask
+    flickers laterally). Judged by measured along-track noise."""
+    import csv as _csv
+    cand = {"centroid": [], "axis_mid": []}
+    frames = []
+    with open(track_path) as fh:
+        for r in _csv.DictReader(fh):
+            f = int(r["frame"])
+            if not (first <= f <= last and int(r["ok"])):
+                continue
+            frames.append(f)
+            cand["centroid"].append((float(r["u"]), float(r["v"])))
+            if r.get("ax_lo_u") not in (None, "", "nan"):
+                mid = ((float(r["ax_lo_u"]) + float(r["ax_hi_u"])) / 2,
+                       (float(r["ax_lo_v"]) + float(r["ax_hi_v"])) / 2)
+            else:
+                mid = cand["centroid"][-1]
+            cand["axis_mid"].append(mid)
+    best, best_sa = None, None
+    for name, uv in cand.items():
+        sc, sa, *_ = estimate_track_noise(np.array(uv))
+        print(f"  center={name}: cross {sc:.2f} px, along {sa:.2f} px")
+        if best_sa is None or sa < best_sa:
+            best, best_sa = name, sa
+    print(f"  using {best}")
+    return frames, np.array(cand[best])
+
+
 def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("smooth-poses")
+    s.add_argument("poses"), s.add_argument("--out", required=True)
     f = sub.add_parser("fit")
     f.add_argument("clip_id"), f.add_argument("track"), f.add_argument("poses")
     f.add_argument("first", type=int), f.add_argument("last", type=int)
     f.add_argument("--fps", type=float, required=True)
     f.add_argument("--half", type=float, default=0.6)
     f.add_argument("--n-boot", type=int, default=30)
+    f.add_argument("--pose-noise", type=float, default=0.0,
+                   help="pose-error floor [px], added in quadrature")
+    f.add_argument("--refined", action="store_true",
+                   help="choose mask-axis center vs centroid by along-noise")
+    f.add_argument("--geom-crossing", action="store_true",
+                   help="measure crossing at the goal-mouth entry frame")
     r = sub.add_parser("render")
     r.add_argument("fit_json"), r.add_argument("video")
     r.add_argument("--out", default=None)
     args = ap.parse_args()
 
+    if args.cmd == "smooth-poses":
+        smooth_poses(args.poses, args.out)
+        return
+
     if args.cmd == "fit":
         cams = load_cameras(args.poses)
-        rows = [t for t in load_track(args.track)
-                if t[4] and args.first <= t[0] <= args.last
-                and t[0] in cams and cams[t[0]][3]]
-        frames_idx = [t[0] for t in rows]
-        times = np.array([(t[0] - rows[0][0]) / args.fps for t in rows])
-        uv = np.array([[t[1], t[2]] for t in rows])
-        print(f"{len(rows)} usable flight observations")
+        if args.refined:
+            frames_all, uv_all = refined_centers(args.track, args.first,
+                                                 args.last)
+            keep = [k for k, f in enumerate(frames_all)
+                    if f in cams and cams[f][3]]
+            frames_idx = [frames_all[k] for k in keep]
+            uv = uv_all[keep]
+            rows = [(f, uv[k][0], uv[k][1], 0, 1)
+                    for k, f in enumerate(frames_idx)]
+        else:
+            rows = [t for t in load_track(args.track)
+                    if t[4] and args.first <= t[0] <= args.last
+                    and t[0] in cams and cams[t[0]][3]]
+            frames_idx = [t[0] for t in rows]
+            uv = np.array([[t[1], t[2]] for t in rows])
+        times = np.array([(f - frames_idx[0]) / args.fps for f in frames_idx])
+        print(f"{len(frames_idx)} usable flight observations")
 
         p0 = ground_ray_point(cams, frames_idx[0], uv[0])
         print(f"launch point (ground ray): ({p0[0]:+.2f}, {p0[1]:.2f}, "
               f"{p0[2]:.2f}) -> {np.hypot(p0[0], p0[1]):.1f} m out")
 
-        cx, cz = goal_plane_point(cams, frames_idx[-1], uv[-1])
+        if args.geom_crossing:
+            ct = crossing_frame_geometric(cams, rows)
+            cx, cz = goal_plane_point(cams, ct[0], (ct[1], ct[2]))
+            print(f"measured crossing (goal-mouth entry, f{ct[0]}): "
+                  f"x={cx:+.2f}, z={cz:.2f} +/- {args.half} m")
+        else:
+            cx, cz = goal_plane_point(cams, frames_idx[-1], uv[-1])
+            print(f"measured crossing (last tracked pixel, f{frames_idx[-1]}): "
+                  f"x={cx:+.2f}, z={cz:.2f} +/- {args.half} m")
         box = (cx, cz, args.half)
-        print(f"measured crossing (last tracked pixel, f{frames_idx[-1]}): "
-              f"x={cx:+.2f}, z={cz:.2f} +/- {args.half} m")
 
-        noise = estimate_track_noise(uv)
-        print(f"track noise: cross {noise[0]:.2f} px, along {noise[1]:.2f} px")
+        sc, sa, t_hat, n_hat = estimate_track_noise(uv)
+        sc = float(np.hypot(sc, args.pose_noise))
+        sa = float(np.hypot(sa, args.pose_noise))
+        noise = (sc, sa, t_hat, n_hat)
+        print(f"track noise incl. pose floor {args.pose_noise} px: "
+              f"cross {sc:.2f} px, along {sa:.2f} px")
 
         res = multicam_fit(times, frames_idx, uv, cams, p0, box, noise)
         theta = res.x
