@@ -68,10 +68,24 @@ def track_video(video_path, click_uv, click_frame=0, extra_points=None):
             mask = (masks[0] > 0.0).cpu().numpy().squeeze()
             ys, xs = np.nonzero(mask)
             if len(xs) == 0:
-                by_frame[frame_idx] = (frame_idx, np.nan, np.nan, 0, 0)
+                by_frame[frame_idx] = (frame_idx, np.nan, np.nan, 0, 0,
+                                       np.nan, np.nan, np.nan, np.nan)
             else:
-                by_frame[frame_idx] = (frame_idx, float(xs.mean()),
-                                       float(ys.mean()), int(len(xs)), 1)
+                pts = np.stack([xs, ys], 1).astype(float)
+                c = pts.mean(0)
+                # principal-axis extremes of the mask: a motion-blurred ball
+                # is a streak, and its endpoints are physically meaningful
+                # (start/end of exposure) where the area centroid wobbles
+                # with mask-extent flicker
+                if len(pts) > 4:
+                    _, _, V = np.linalg.svd(pts - c, full_matrices=False)
+                    proj = (pts - c) @ V[0]
+                    lo, hi = pts[np.argmin(proj)], pts[np.argmax(proj)]
+                else:
+                    lo = hi = c
+                by_frame[frame_idx] = (frame_idx, float(c[0]), float(c[1]),
+                                       int(len(xs)), 1, float(lo[0]),
+                                       float(lo[1]), float(hi[0]), float(hi[1]))
     rows = [by_frame[k] for k in sorted(by_frame)]
 
     # a ball mask is a few hundred px; a huge one means the click missed
@@ -95,9 +109,12 @@ def track_video(video_path, click_uv, click_frame=0, extra_points=None):
 
 def save_track(rows, out_path):
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    header = ["frame", "u", "v", "area", "ok"]
+    if rows and len(rows[0]) > 5:
+        header += ["ax_lo_u", "ax_lo_v", "ax_hi_u", "ax_hi_v"]
     with open(out_path, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["frame", "u", "v", "area", "ok"])
+        w.writerow(header)
         w.writerows(rows)
 
 
