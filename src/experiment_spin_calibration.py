@@ -153,7 +153,10 @@ def verify():
 # Ronaldo camera pans; the "flight" was a divot + pan artifact). The
 # clipmatch validation therefore characterizes the solver at this
 # SYNTHETIC noise point only — it is not validated for any real clip.
-CLIP_POINT = (1.6, 4.9)
+# overridable so clip-matched validations can run at any measured noise
+# point (workers re-import this module, so use the environment, not argv)
+CLIP_POINT = tuple(map(float, os.environ.get(
+    "CLIP_POINT", "1.6,4.9").split(",")))
 RATIO_RECHECK = {"r4": (1.5, 6.0), "r10": (1.5, 15.0)}
 VARIANT_INDEX = {"scalar": 0, "aniso": 1, "r4": 2, "r10": 3}
 
@@ -195,7 +198,7 @@ def clipmatch():
             if n % 20 == 0:
                 print(f"  {n}/{len(jobs)} done", flush=True)
 
-    print(f"\ncoverage at Ronaldo noise point (nominal 68%, SE ~5pp at n=80):")
+    print(f"\ncoverage at {CLIP_POINT} px (nominal 68%, SE ~5pp at n=80):")
     print(f"{'quantity':<18}{'scalar whiten':>15}{'aniso whiten':>15}")
     cov_s = np.mean(results["scalar"], axis=0)
     cov_a = np.mean(results["aniso"], axis=0)
