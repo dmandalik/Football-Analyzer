@@ -203,11 +203,141 @@ def refined_centers(track_path, first, last):
     return frames, np.array(cand[best])
 
 
+POLY_DEG = 5
+
+
+def bundle_adjust(poses_path, track_path, first, last, fps, half,
+                  out_poses, clip_id):
+    """Joint fit: camera poses (smooth tripod curves) + trajectory, against
+    ALL goal-corner observations and the ball track simultaneously. The
+    ball and the corners choose the pose curves together — this removes the
+    pose-systematic that smoothing-then-fitting leaves behind."""
+    from src.goal_pnp import GOAL_3D
+
+    d = np.load(poses_path)
+    frames_all = d["frames"].astype(float)
+    ok = d["ok"].astype(bool)
+    corners_obs = d["corners"]
+    C = d["C"]
+    rv_raw = d["rvecs"].reshape(len(frames_all), 3)
+
+    # ball observations (refined centers)
+    fb, uvb = refined_centers(track_path, first, last)
+    fb = np.array(fb, float)
+    times = (fb - fb[0]) / fps
+    sc, sa, t_hat, n_hat = estimate_track_noise(uvb)
+    sc, sa = max(1.0, sc), max(2.0, sa)
+    print(f"ball whitening: cross {sc:.2f}, along {sa:.2f} px")
+
+    # goal geometry sign, as in smooth_poses
+    obj = np.array([v for v in GOAL_3D.values()], float)
+    best = None
+    for s in (1.0, -1.0):
+        o = obj.copy(); o[:, 0] *= s
+        R0, _ = cv2.Rodrigues(rv_raw[np.where(ok)[0][0]])
+        K0 = np.array([[d["fs"][np.where(ok)[0][0]], 0, 960],
+                       [0, d["fs"][np.where(ok)[0][0]], 540], [0, 0, 1]])
+        q = (K0 @ (R0 @ (o - C).T)).T
+        uv = q[:, :2] / q[:, 2:]
+        e = np.sqrt(np.mean((uv - corners_obs[np.where(ok)[0][0]]) ** 2))
+        if best is None or e < best[1]:
+            best = (o, e)
+    obj_s = best[0]
+
+    # initial pose curves + initial trajectory from the existing fit
+    tnorm = (frames_all - frames_all.mean()) / 30.0
+    coefR0 = [np.polyfit(tnorm[ok], rv_raw[ok, c], POLY_DEG) for c in range(3)]
+    coefF0 = np.polyfit(tnorm[ok], d["fs"][ok], POLY_DEG)
+    fit0 = json.load(open(f"data/fits/{clip_id}.json"))
+    theta0 = np.array(fit0["theta6"])
+    p0_init = np.array(fit0["p0"])
+    box = tuple(fit0["box"])
+    nC = POLY_DEG + 1
+
+    def unpack_params(p):
+        cR = [p[c * nC:(c + 1) * nC] for c in range(3)]
+        cF = p[3 * nC:4 * nC]
+        x0, y0 = p[4 * nC], p[4 * nC + 1]
+        theta = p[4 * nC + 2:]
+        return cR, cF, np.array([x0, y0, RADIUS]), theta
+
+    def pose_at(cR, cF, tn):
+        rv = np.array([np.polyval(cR[c], tn) for c in range(3)])
+        R, _ = cv2.Rodrigues(rv)
+        f = np.polyval(cF, tn)
+        K = np.array([[f, 0, 960], [0, f, 540], [0, 0, 1.0]])
+        return K, R
+
+    tn_all = tnorm
+    tn_ball = (fb - frames_all.mean()) / 30.0
+
+    def resid(p):
+        cR, cF, p0, theta = unpack_params(p)
+        r = []
+        for k in np.where(ok)[0]:
+            K, R = pose_at(cR, cF, tn_all[k])
+            q = (K @ (R @ (obj_s - C).T)).T
+            uv = q[:, :2] / q[:, 2:]
+            r.append(((uv - corners_obs[k]) / 3.0).ravel())
+        xyz = simulate(p0, theta[:3], theta[3:], times)
+        duv = []
+        for k in range(len(fb)):
+            K, R = pose_at(cR, cF, tn_ball[k])
+            q = K @ (R @ (xyz[k] - C))
+            duv.append(q[:2] / q[2] - uvb[k])
+        duv = np.array(duv)
+        r.append(np.sum(duv * n_hat, axis=1) / sc)
+        r.append(np.sum(duv * t_hat, axis=1) / sa)
+        r.append(crossing_hinge(p0, theta[:3], theta[3:], box))
+        r.append((np.array([p0[0], p0[1]]) - p0_init[:2]) / 0.3)
+        return np.concatenate(r)
+
+    p_init = np.concatenate(coefR0 + [coefF0, p0_init[:2], theta0])
+    lo = np.concatenate([np.full(4 * nC, -np.inf), p0_init[:2] - 2.0, LOWER6])
+    hi = np.concatenate([np.full(4 * nC, np.inf), p0_init[:2] + 2.0, UPPER6])
+    print(f"bundle adjustment: {len(p_init)} params, "
+          f"{ok.sum() * 8 + 2 * len(fb) + 4} residuals")
+    res = least_squares(resid, p_init, bounds=(lo, hi), method="trf",
+                        x_scale="jac")
+    cR, cF, p0, theta = unpack_params(res.x)
+
+    # report: corner rms and ball rms through the BA poses
+    r = resid(res.x)
+    n_corner = ok.sum() * 8
+    corner_rms = float(np.sqrt(np.mean(r[:n_corner] ** 2)) * 3.0)
+    cross_rms = float(np.sqrt(np.mean(r[n_corner:n_corner + len(fb)] ** 2)) * sc)
+    along_rms = float(np.sqrt(np.mean(
+        r[n_corner + len(fb):n_corner + 2 * len(fb)] ** 2)) * sa)
+    print(f"BA: status {res.status}; corner rms {corner_rms:.2f} px, ball "
+          f"cross rms {cross_rms:.2f} px, along rms {along_rms:.2f} px")
+
+    # write BA poses npz for the renderer
+    rvecs, tvecs, fs = [], [], []
+    for k in range(len(frames_all)):
+        K, R = pose_at(cR, cF, tn_all[k])
+        rv, _ = cv2.Rodrigues(R)
+        rvecs.append(rv.reshape(3, 1))
+        tvecs.append((-R @ C).reshape(3, 1))
+        fs.append(K[0, 0])
+    np.savez(out_poses, K=d["K"], frames=d["frames"],
+             rvecs=np.stack(rvecs), tvecs=np.stack(tvecs),
+             fs=np.array(fs), C=C, ok=d["ok"], corners=corners_obs)
+    print(f"BA poses -> {out_poses}")
+    return theta, p0, box, (sc, sa, t_hat, n_hat), fb, uvb, times
+
+
 def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("smooth-poses")
     s.add_argument("poses"), s.add_argument("--out", required=True)
+    b = sub.add_parser("ba")
+    b.add_argument("clip_id"), b.add_argument("track"), b.add_argument("poses")
+    b.add_argument("first", type=int), b.add_argument("last", type=int)
+    b.add_argument("--fps", type=float, required=True)
+    b.add_argument("--half", type=float, default=0.6)
+    b.add_argument("--n-boot", type=int, default=25)
+    b.add_argument("--out-poses", required=True)
     f = sub.add_parser("fit")
     f.add_argument("clip_id"), f.add_argument("track"), f.add_argument("poses")
     f.add_argument("first", type=int), f.add_argument("last", type=int)
@@ -227,6 +357,58 @@ def main():
 
     if args.cmd == "smooth-poses":
         smooth_poses(args.poses, args.out)
+        return
+
+    if args.cmd == "ba":
+        theta, p0, box, noise, fb, uvb, times = bundle_adjust(
+            args.poses, args.track, args.first, args.last, args.fps,
+            args.half, args.out_poses, args.clip_id)
+        cams = load_cameras(args.out_poses)
+        frames_idx = [int(f) for f in fb]
+        xyz_fit = simulate(p0, theta[:3], theta[3:], times)
+        uv_clean = np.array([project_frame(cams, f, xyz_fit[k])[0]
+                             for k, f in enumerate(frames_idx)])
+        rng = np.random.default_rng(0)
+        samples = []
+        for _ in range(args.n_boot):
+            uvb2 = anisotropic_noise(uv_clean, noise[0], noise[1], rng)
+            rb = multicam_fit(times, frames_idx, uvb2, cams, p0, box, noise)
+            if rb.status > 0:
+                samples.append(rb.x)
+        q = np.array([flight_quantities(sm) for sm in samples])
+        lo, hi = np.percentile(q, [16, 84], axis=0)
+        centre, half_i = 0.5 * (lo + hi), 0.5 * (hi - lo)
+        bias, infl = spin_correction(noise[0])
+        centre[3] -= bias
+        half_i[3] *= infl
+        half_i[4] *= SPIN_INTERVAL_INFLATION
+        intervals = np.stack([centre - half_i, centre + half_i], axis=1)
+        qf = flight_quantities(theta)
+        qf[3] -= bias
+        print(f"\n{'quantity':<18}{'estimate':>10}{'68% interval':>20}")
+        for i, name in enumerate(QUANTITY_NAMES):
+            note = ("  (debiased)" if i == 3 else
+                    "  (UNOBSERVABLE)" if i == 4 else "")
+            print(f"{name:<18}{qf[i]:>10.2f}"
+                  f"{f'[{intervals[i,0]:.2f}, {intervals[i,1]:.2f}]':>20}{note}")
+        fc = fitted_crossing(theta, p0)
+        if fc:
+            miss = np.hypot(fc[0] - box[0], fc[1] - box[1])
+            print(f"\ngoal-mouth check: fitted x={fc[0]:+.2f}, z={fc[1]:.2f} "
+                  f"vs measured x={box[0]:+.2f}, z={box[1]:.2f} -> {miss:.2f} m")
+        out = f"data/fits/{args.clip_id}.json"
+        json.dump({"clip_id": args.clip_id, "theta6": theta.tolist(),
+                   "p0": p0.tolist(),
+                   "window": [frames_idx[0], frames_idx[-1]],
+                   "fps": args.fps, "box": list(box),
+                   "quantities": dict(zip(QUANTITY_NAMES, qf.tolist())),
+                   "intervals": intervals.tolist(),
+                   "noise": [noise[0], noise[1]],
+                   "samples": [sm.tolist() for sm in samples],
+                   "poses": args.out_poses, "track": args.track,
+                   "method": "bundle-adjusted"},
+                  open(out, "w"), indent=1)
+        print(f"saved {out}")
         return
 
     if args.cmd == "fit":
