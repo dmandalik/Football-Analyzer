@@ -62,6 +62,11 @@ def main():
             "spin_interval": [round(v, 0) for v in fit["intervals"][3]],
             "distance_m": round(float(np.hypot(p0[0], p0[1])), 1),
             "crossing": fit["box"][:2],
+            # keeper reachability at the crossing: reaction 0.30 s, then an
+            # effective dive that extends reach at 3.2 m/s from a 0.85 m
+            # standing envelope, capped at a full-stretch 3.4 m. Model
+            # parameters are displayed in the UI, not hidden.
+            "reach_m": round(min(3.4, 0.85 + 3.2 * max(0.0, t_end - 0.30)), 2),
             "path": path(p0, theta, t_end),
             "bundle": [path(p0, s, t_end, 60) for s in samples],
         })

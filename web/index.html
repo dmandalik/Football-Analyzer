@@ -177,9 +177,35 @@ function showKick(k) {
     new THREE.MeshBasicMaterial({ color: 0xffb31a, side: THREE.DoubleSide }));
   lp.rotation.x = -Math.PI/2; lp.position.copy(W(k.launch)).setY(.03);
   trajGroup.add(lp);
+  // keeper reachability half-disc in the goal plane + crossing marker
+  const reach = new THREE.Mesh(
+    new THREE.CircleGeometry(k.reach_m, 48, 0, Math.PI),
+    new THREE.MeshBasicMaterial({ color: 0x35c48d, transparent: true,
+                                  opacity: .17, side: THREE.DoubleSide }));
+  reach.position.set(0, 0, 0);
+  trajGroup.add(reach);
+  const reachEdge = new THREE.Line(
+    new THREE.BufferGeometry().setFromPoints(
+      Array.from({length: 49}, (_, i) => {
+        const a = Math.PI * i / 48;
+        return new THREE.Vector3(k.reach_m*Math.cos(a), k.reach_m*Math.sin(a), 0);
+      })),
+    new THREE.LineBasicMaterial({ color: 0x35c48d, transparent: true, opacity: .6 }));
+  trajGroup.add(reachEdge);
+  const [cx, cz] = k.crossing;
+  const dCross = Math.hypot(cx, cz);
+  const beat = dCross > k.reach_m;
+  const cross = new THREE.Mesh(new THREE.RingGeometry(.12, .2, 24),
+    new THREE.MeshBasicMaterial({ color: beat ? 0xff5252 : 0x35c48d,
+                                  side: THREE.DoubleSide }));
+  cross.position.set(cx, cz, 0);
+  trajGroup.add(cross);
   flightS = k.flight_s;
-  document.getElementById("hud").textContent =
-    `${k.player} — ${k.match} · ${k.distance_m} m out · flight ${k.flight_s.toFixed(2)} s`;
+  const margin = Math.abs(dCross - k.reach_m).toFixed(2);
+  document.getElementById("hud").innerHTML =
+    `${k.player} — ${k.match} · ${k.distance_m} m out · flight ${k.flight_s.toFixed(2)} s<br>` +
+    `keeper model (0.30 s reaction + dive): crossing ` +
+    `<span style="color:${beat ? "#ff5252" : "#35c48d"}">${margin} m ${beat ? "beyond" : "within"} reach</span>`;
   replay();
 }
 function replay(){ t0 = performance.now(); playing = true; }
