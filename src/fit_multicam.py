@@ -30,10 +30,11 @@ from src.fitting import (LOWER6, UPPER6, DEFAULT_GUESS6, QUANTITY_NAMES,
 
 def load_cameras(poses_path):
     d = np.load(poses_path)
+    cx, cy = float(d["K"][0, 2]), float(d["K"][1, 2])  # clip resolution varies
     cams = {}
     for k, f in enumerate(d["frames"]):
         fk = float(d["fs"][k])
-        K = np.array([[fk, 0, 960.0], [0, fk, 540.0], [0, 0, 1.0]])
+        K = np.array([[fk, 0, cx], [0, fk, cy], [0, 0, 1.0]])
         R, _ = cv2.Rodrigues(d["rvecs"][k])
         cams[int(f)] = (K, R, d["tvecs"][k].reshape(3), bool(d["ok"][k]))
     return cams
@@ -73,11 +74,19 @@ def fitted_crossing(theta, p0):
     return float(c[0]), float(c[2])
 
 
+def simulate_at(p0, v0, omega, times):
+    """simulate() pins (p0, v0) at times[0]; when the kick precedes the
+    first observation, times[0] > 0 and the launch must anchor at t=0."""
+    if times[0] == 0.0:
+        return simulate(p0, v0, omega, times)
+    return simulate(p0, v0, omega, np.concatenate([[0.0], times]))[1:]
+
+
 def multicam_fit(times, frames_idx, uv, cams, p0, box, noise):
     sc, sa, t_hat, n_hat = noise
 
     def resid(theta):
-        xyz = simulate(p0, theta[:3], theta[3:], times)
+        xyz = simulate_at(p0, theta[:3], theta[3:], times)
         d = np.array([project_frame(cams, f, xyz[k])[0]
                       for k, f in enumerate(frames_idx)]) - uv
         r = np.concatenate([np.sum(d * n_hat, axis=1) / sc,
@@ -101,6 +110,7 @@ def smooth_poses(poses_path, out_path, deg=None):
     ok = d["ok"].astype(bool)
     rv = d["rvecs"].reshape(len(frames), 3)
     C = d["C"]
+    cx, cy = float(d["K"][0, 2]), float(d["K"][1, 2])
 
     def build(deg_try):
         out_rv = np.stack([np.polyval(np.polyfit(frames[ok], rv[ok, c],
@@ -117,9 +127,7 @@ def smooth_poses(poses_path, out_path, deg=None):
         errs = []
         for k in np.where(ok)[0]:
             R, _ = cv2.Rodrigues(out_rv[k])
-            K = np.array([[fs[k], 0, 960], [0, fs[k], 540], [0, 0, 1.0]])
-            q = (K @ (R @ (obj_signed - C).T + (-R @ C).reshape(3, 1)
-                      + (R @ C).reshape(3, 1) - (R @ C).reshape(3, 1))).T
+            K = np.array([[fs[k], 0, cx], [0, fs[k], cy], [0, 0, 1.0]])
             q = (K @ (R @ (obj_signed - C).T)).T
             uv = q[:, :2] / q[:, 2:]
             errs.append(np.sqrt(np.mean((uv - d["corners"][k]) ** 2)))
@@ -220,11 +228,16 @@ def bundle_adjust(poses_path, track_path, first, last, fps, half,
     corners_obs = d["corners"]
     C = d["C"]
     rv_raw = d["rvecs"].reshape(len(frames_all), 3)
+    cx, cy = float(d["K"][0, 2]), float(d["K"][1, 2])
 
-    # ball observations (refined centers)
+    # ball observations (refined centers); the kick may precede the first
+    # observation (see the fit command's --kick-frame) — the prior fit's
+    # json records it and simulate_at anchors the launch at t=0
     fb, uvb = refined_centers(track_path, first, last)
     fb = np.array(fb, float)
-    times = (fb - fb[0]) / fps
+    kick = json.load(open(f"data/fits/{clip_id}.json")).get(
+        "kick_frame", fb[0])
+    times = (fb - kick) / fps
     sc, sa, t_hat, n_hat = estimate_track_noise(uvb)
     sc, sa = max(1.0, sc), max(2.0, sa)
     print(f"ball whitening: cross {sc:.2f}, along {sa:.2f} px")
@@ -235,8 +248,8 @@ def bundle_adjust(poses_path, track_path, first, last, fps, half,
     for s in (1.0, -1.0):
         o = obj.copy(); o[:, 0] *= s
         R0, _ = cv2.Rodrigues(rv_raw[np.where(ok)[0][0]])
-        K0 = np.array([[d["fs"][np.where(ok)[0][0]], 0, 960],
-                       [0, d["fs"][np.where(ok)[0][0]], 540], [0, 0, 1]])
+        K0 = np.array([[d["fs"][np.where(ok)[0][0]], 0, cx],
+                       [0, d["fs"][np.where(ok)[0][0]], cy], [0, 0, 1]])
         q = (K0 @ (R0 @ (o - C).T)).T
         uv = q[:, :2] / q[:, 2:]
         e = np.sqrt(np.mean((uv - corners_obs[np.where(ok)[0][0]]) ** 2))
@@ -265,7 +278,7 @@ def bundle_adjust(poses_path, track_path, first, last, fps, half,
         rv = np.array([np.polyval(cR[c], tn) for c in range(3)])
         R, _ = cv2.Rodrigues(rv)
         f = np.polyval(cF, tn)
-        K = np.array([[f, 0, 960], [0, f, 540], [0, 0, 1.0]])
+        K = np.array([[f, 0, cx], [0, f, cy], [0, 0, 1.0]])
         return K, R
 
     tn_all = tnorm
@@ -279,7 +292,7 @@ def bundle_adjust(poses_path, track_path, first, last, fps, half,
             q = (K @ (R @ (obj_s - C).T)).T
             uv = q[:, :2] / q[:, 2:]
             r.append(((uv - corners_obs[k]) / 3.0).ravel())
-        xyz = simulate(p0, theta[:3], theta[3:], times)
+        xyz = simulate_at(p0, theta[:3], theta[3:], times)
         duv = []
         for k in range(len(fb)):
             K, R = pose_at(cR, cF, tn_ball[k])
@@ -323,7 +336,7 @@ def bundle_adjust(poses_path, track_path, first, last, fps, half,
              rvecs=np.stack(rvecs), tvecs=np.stack(tvecs),
              fs=np.array(fs), C=C, ok=d["ok"], corners=corners_obs)
     print(f"BA poses -> {out_poses}")
-    return theta, p0, box, (sc, sa, t_hat, n_hat), fb, uvb, times
+    return theta, p0, box, (sc, sa, t_hat, n_hat), fb, uvb, times, kick
 
 
 def main():
@@ -350,6 +363,14 @@ def main():
                    help="choose mask-axis center vs centroid by along-noise")
     f.add_argument("--geom-crossing", action="store_true",
                    help="measure crossing at the goal-mouth entry frame")
+    f.add_argument("--kick-frame", type=float, default=None,
+                   help="frame of ball-ground contact when the kick is "
+                        "before the first observation (may be negative "
+                        "and fractional - contact is rarely on a frame)")
+    f.add_argument("--launch-xy", type=float, nargs=2, default=None,
+                   metavar=("X", "Y"),
+                   help="measured launch point [m] (e.g. from the resting-"
+                        "ball pixel), overrides the first-observation ray")
     r = sub.add_parser("render")
     r.add_argument("fit_json"), r.add_argument("video")
     r.add_argument("--out", default=None)
@@ -360,12 +381,12 @@ def main():
         return
 
     if args.cmd == "ba":
-        theta, p0, box, noise, fb, uvb, times = bundle_adjust(
+        theta, p0, box, noise, fb, uvb, times, kick = bundle_adjust(
             args.poses, args.track, args.first, args.last, args.fps,
             args.half, args.out_poses, args.clip_id)
         cams = load_cameras(args.out_poses)
         frames_idx = [int(f) for f in fb]
-        xyz_fit = simulate(p0, theta[:3], theta[3:], times)
+        xyz_fit = simulate_at(p0, theta[:3], theta[3:], times)
         uv_clean = np.array([project_frame(cams, f, xyz_fit[k])[0]
                              for k, f in enumerate(frames_idx)])
         rng = np.random.default_rng(0)
@@ -403,7 +424,7 @@ def main():
                    "fps": args.fps, "box": list(box),
                    "quantities": dict(zip(QUANTITY_NAMES, qf.tolist())),
                    "intervals": intervals.tolist(),
-                   "noise": [noise[0], noise[1]],
+                   "noise": [noise[0], noise[1]], "kick_frame": kick,
                    "samples": [sm.tolist() for sm in samples],
                    "poses": args.out_poses, "track": args.track,
                    "method": "bundle-adjusted"},
@@ -428,12 +449,19 @@ def main():
                     and t[0] in cams and cams[t[0]][3]]
             frames_idx = [t[0] for t in rows]
             uv = np.array([[t[1], t[2]] for t in rows])
-        times = np.array([(f - frames_idx[0]) / args.fps for f in frames_idx])
-        print(f"{len(frames_idx)} usable flight observations")
+        t0f = args.kick_frame if args.kick_frame is not None else frames_idx[0]
+        times = np.array([(f - t0f) / args.fps for f in frames_idx])
+        print(f"{len(frames_idx)} usable flight observations"
+              + (f", kick at frame {t0f}" if t0f != frames_idx[0] else ""))
 
-        p0 = ground_ray_point(cams, frames_idx[0], uv[0])
-        print(f"launch point (ground ray): ({p0[0]:+.2f}, {p0[1]:.2f}, "
-              f"{p0[2]:.2f}) -> {np.hypot(p0[0], p0[1]):.1f} m out")
+        if args.launch_xy:
+            p0 = np.array([args.launch_xy[0], args.launch_xy[1], RADIUS])
+            print(f"launch point (measured): ({p0[0]:+.2f}, {p0[1]:.2f}, "
+                  f"{p0[2]:.2f}) -> {np.hypot(p0[0], p0[1]):.1f} m out")
+        else:
+            p0 = ground_ray_point(cams, frames_idx[0], uv[0])
+            print(f"launch point (ground ray): ({p0[0]:+.2f}, {p0[1]:.2f}, "
+                  f"{p0[2]:.2f}) -> {np.hypot(p0[0], p0[1]):.1f} m out")
 
         if args.geom_crossing:
             ct = crossing_frame_geometric(cams, rows)
@@ -455,7 +483,7 @@ def main():
 
         res = multicam_fit(times, frames_idx, uv, cams, p0, box, noise)
         theta = res.x
-        xyz_fit = simulate(p0, theta[:3], theta[3:], times)
+        xyz_fit = simulate_at(p0, theta[:3], theta[3:], times)
         d = np.array([project_frame(cams, f, xyz_fit[k])[0]
                       for k, f in enumerate(frames_idx)]) - uv
         rms = float(np.sqrt(np.mean(d ** 2)))
@@ -503,6 +531,7 @@ def main():
                    "quantities": dict(zip(QUANTITY_NAMES, qf.tolist())),
                    "intervals": intervals.tolist(),
                    "noise": [noise[0], noise[1]], "reproj_rms": rms,
+                   "kick_frame": t0f,
                    "samples": [s.tolist() for s in samples],
                    "poses": args.poses, "track": args.track},
                   open(out, "w"), indent=1)
@@ -515,7 +544,8 @@ def main():
     p0 = np.array(fit["p0"])
     a, b = fit["window"]
     fps = fit["fps"]
-    t_end = (b - a) / fps
+    t0f = fit.get("kick_frame", a)   # kick may precede the first observation
+    t_end = (b - t0f) / fps
     tf = np.linspace(0.0, t_end, 140)
     xyz_best = simulate(p0, theta[:3], theta[3:], tf)
     xyz_samp = [simulate(p0, np.array(s)[:3], np.array(s)[3:], tf)
@@ -549,7 +579,7 @@ def main():
                 draw_poly(frame, idx, xs, (200, 200, 80), 1)
             draw_poly(frame, idx, xyz_best, (0, 210, 255), 2)
             draw_poly(frame, idx, box3, (0, 0, 255), 2)
-            t = (idx - a) / fps
+            t = (idx - t0f) / fps
             if 0 <= t <= t_end:
                 pos = simulate(p0, theta[:3], theta[3:], np.array([0.0, t]))[-1]
                 u, v = project_frame(cams, idx, pos)[0]
