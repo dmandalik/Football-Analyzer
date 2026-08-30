@@ -22,6 +22,8 @@ META = {
                    "foot": "L"},
     "messi2": {"player": "Lionel Messi",
                "match": "vs Cruz Azul (Leagues Cup 2023)", "foot": "L"},
+    "ronaldo_wc": {"player": "Cristiano Ronaldo",
+                   "match": "vs Spain (World Cup 2018)", "foot": "R"},
 }
 
 
