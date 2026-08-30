@@ -371,6 +371,12 @@ def main():
                    metavar=("X", "Y"),
                    help="measured launch point [m] (e.g. from the resting-"
                         "ball pixel), overrides the first-observation ray")
+    f.add_argument("--box", type=float, nargs=2, default=None,
+                   metavar=("X", "Z"),
+                   help="crossing box center [m], overriding pixel back-"
+                        "projection (needed when the camera is oblique to "
+                        "the goal plane: a pixel short of the plane back-"
+                        "projects meters wide)")
     r = sub.add_parser("render")
     r.add_argument("fit_json"), r.add_argument("video")
     r.add_argument("--out", default=None)
@@ -468,6 +474,10 @@ def main():
             cx, cz = goal_plane_point(cams, ct[0], (ct[1], ct[2]))
             print(f"measured crossing (goal-mouth entry, f{ct[0]}): "
                   f"x={cx:+.2f}, z={cz:.2f} +/- {args.half} m")
+        elif args.box:
+            cx, cz = args.box
+            print(f"crossing box (measured entry): x={cx:+.2f}, z={cz:.2f} "
+                  f"+/- {args.half} m")
         else:
             cx, cz = goal_plane_point(cams, frames_idx[-1], uv[-1])
             print(f"measured crossing (last tracked pixel, f{frames_idx[-1]}): "

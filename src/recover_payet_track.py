@@ -41,6 +41,12 @@ CFG = {
                    h=1080, fps=30.0, rest=(1045.0, 800.0), first=21, last=88,
                    blob_max=400, r_first=40, launch_off=(-40.0, -28.0),
                    vmin=4.0),
+    "ronaldo_wc": dict(poses="data/calibrations/ronaldo_wc_poses.npz",
+                       frames="data/raw_clips/ronaldo_wc_frames", n=275,
+                       w=1920, h=1080, fps=50.0, rest=(645.0, 654.0),
+                       first=53, last=95, blob_max=300, r_first=48,
+                       launch_off=(120.0, -80.0), vmin=5.0, floor=3.5,
+                       g_px=1.1),
 }
 CLIP = CFG[sys.argv[1] if len(sys.argv) > 1 else "payet3"]
 CLIP_ID = sys.argv[1] if len(sys.argv) > 1 else "payet3"
@@ -54,7 +60,8 @@ BLOB_MAX = CLIP["blob_max"]
 R_FIRST = CLIP["r_first"]
 LAUNCH_OFF = np.array(CLIP["launch_off"])   # prior: ball departs toward goal
 VMIN = CLIP["vmin"]                         # px/frame; slower hits = not the ball
-SCORE_FLOOR = 10.0
+SCORE_FLOOR = CLIP.get("floor", 10.0)
+G_PX = CLIP.get("g_px", 0.0)   # image-space gravity for coast prediction
 
 
 def main():
@@ -133,6 +140,8 @@ def main():
             chain[f], pos = found, found
         else:
             pos = pred                 # coast through the miss
+        if vel is not None:
+            vel = vel + np.array([0.0, G_PX])   # ballistic prior, not linear
         print(f"f{f}: score {mx:5.1f} at ({pos[0]:6.1f},{pos[1]:6.1f})"
               f" {'HIT' if hit else 'coast'}"
               + (f"  vel ({vel[0]:+5.1f},{vel[1]:+5.1f})" if vel is not None
