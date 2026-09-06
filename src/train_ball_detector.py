@@ -81,14 +81,47 @@ def triplets(clip):
     return out
 
 
-def heatmap(u, v):
+def heatmap(u, v, sigma=SIGMA):
     yy, xx = np.mgrid[0:H, 0:W]
-    return np.exp(-((xx - u) ** 2 + (yy - v) ** 2) / (2 * SIGMA ** 2))
+    return np.exp(-((xx - u) ** 2 + (yy - v) ** 2) / (2 * sigma ** 2))
+
+
+SN_MANIFEST = "data/soccernet_manifest.csv"
+SN_SIGMA = 3.5   # SoccerNet ball labels carry 5-30 px jitter — soften targets
+
+
+def sn_tracks():
+    if not hasattr(sn_tracks, "_c"):
+        c = {}
+        for r in csv.DictReader(open(SN_MANIFEST)):
+            c.setdefault(r["seq_dir"], {})[int(r["frame"])] = (
+                float(r["u"]), float(r["v"]))
+        sn_tracks._c = c
+    return sn_tracks._c
+
+
+def sn_samples(stride=2):
+    """Manifest entries with labeled neighbors, as (("sn", seq_dir), f)."""
+    out = []
+    for seq, t in sn_tracks().items():
+        fs = sorted(t)
+        for f in fs[::stride]:
+            if f - 1 in t and f + 1 in t:
+                out.append((("sn", seq), f))
+    return out
+
+
+def _resolve(clip):
+    """-> (track dict, frames dir, filename fmt, target sigma)."""
+    if isinstance(clip, tuple) and clip[0] == "sn":
+        return sn_tracks()[clip[1]], clip[1], "{:06d}.jpg", SN_SIGMA
+    t, fdir = tracks._cache.setdefault(clip, tracks(clip))
+    return t, fdir, "{}.jpg", SIGMA
 
 
 def make_sample(clip, f, rng, negative=False):
-    t, fdir = tracks._cache.setdefault(clip, tracks(clip))
-    imgs = [cv2.imread(f"{fdir}/{g}.jpg") for g in (f - 1, f, f + 1)]
+    t, fdir, fmt, sigma = _resolve(clip)
+    imgs = [cv2.imread(f"{fdir}/{fmt.format(g)}") for g in (f - 1, f, f + 1)]
     ih, iw = imgs[0].shape[:2]
     u, v = t[f]
     if negative:   # crop that excludes the ball
@@ -110,7 +143,7 @@ def make_sample(clip, f, rng, negative=False):
         gu, gv = t.get(g, (np.nan, np.nan))
         hm = np.zeros((H, W), np.float32)
         if not negative and np.isfinite(gu) and 0 <= gu - x0 < W and 0 <= gv - y0 < H:
-            hm = heatmap(gu - x0, gv - y0).astype(np.float32)
+            hm = heatmap(gu - x0, gv - y0, sigma).astype(np.float32)
         if flip:
             c, hm = c[:, ::-1], hm[:, ::-1]
         xs.append(((c - MEAN) / STD).transpose(2, 0, 1))
@@ -202,13 +235,18 @@ def main():
             model.to(device)
         evaluate(model, device)
         return
-    # train
-    samp = [s for c in CLIPS if c != HELD_OUT for s in triplets(c)]
-    print(f"finetuning on {len(samp)} samples ({HELD_OUT} held out), {device}")
+    # train: SoccerNet corpus + our verified labels oversampled 8x
+    ours = [s for c in CLIPS if c != HELD_OUT for s in triplets(c)]
+    sn = sn_samples(stride=2) if os.path.exists(SN_MANIFEST) else []
+    samp = sn + ours * (8 if sn else 1)
+    print(f"finetuning on {len(samp)} samples "
+          f"({len(sn)} soccernet + {len(ours)}x8 ours; {HELD_OUT} held out), "
+          f"{device}", flush=True)
     opt = torch.optim.Adam(model.parameters(), lr=1e-4)
     model.train()
     step = 0
-    for epoch in range(12):
+    n_epochs = 3 if sn else 12
+    for epoch in range(n_epochs):
         losses = []
         for x, y in batches(samp, rng):
             x, y = x.to(device), y.to(device)

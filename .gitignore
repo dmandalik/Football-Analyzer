@@ -1,5 +1,12 @@
+**/.DS_Store
+.DS_Store
 __pycache__/
 data/raw_clips/
-models/
-reports/*.npz
+data/soccernet/
 external/
+models/
+models/*.pth
+models/*.pth.tar
+reports/*.npz
+third_party/
+data/soccernet_manifest.csv
