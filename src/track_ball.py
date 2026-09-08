@@ -90,6 +90,12 @@ def detect(clip, frames_dir, poses_path, first, last,
                 mp = torch.nn.functional.max_pool2d(hm[None, None], 5, 1, 2)[0, 0]
                 pk = torch.nonzero((hm == mp) & (hm > CONF_FLOOR))
                 for py, px in pk.tolist():
+                    # peaks near a tile seam see a truncated ball; the
+                    # overlapping neighbor tile covers that region properly
+                    if ((px < 10 and x0 > 0) or (px > TILE_W - 10 and
+                            x0 + TILE_W < iw) or (py < 10 and y0 > 0) or
+                            (py > TILE_H - 10 and y0 + TILE_H < ih)):
+                        continue
                     cands.append((x0 + px, y0 + py, hm[py, px].item()))
         # merge duplicates from tile overlap, keep top K
         cands.sort(key=lambda c: -c[2])
