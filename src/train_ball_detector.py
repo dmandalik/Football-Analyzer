@@ -137,8 +137,21 @@ def make_sample(clip, f, rng, negative=False):
     flip = rng.random() < 0.5
     gain = rng.uniform(0.8, 1.2)
     bias = rng.uniform(-20, 20)
+    # motion-blur augmentation: SoccerNet balls are mostly sharp; live-speed
+    # free-kick balls are directional smears. Same kernel on all 3 frames.
+    kblur = None
+    if rng.random() < 0.5:
+        L = int(rng.integers(4, 16))
+        ang = rng.uniform(0, np.pi)
+        kblur = np.zeros((L, L), np.float32)
+        cv2.line(kblur, (0, L // 2), (L - 1, L // 2), 1.0, 1)
+        M = cv2.getRotationMatrix2D((L / 2, L / 2), np.degrees(ang), 1.0)
+        kblur = cv2.warpAffine(kblur, M, (L, L))
+        kblur /= max(kblur.sum(), 1e-6)
     for g, img in zip((f - 1, f, f + 1), imgs):
         c = img[y0:y0 + H, x0:x0 + W].astype(np.float32)
+        if kblur is not None:
+            c = cv2.filter2D(c, -1, kblur)
         c = np.clip(c * gain + bias, 0, 255)[:, :, ::-1] / 255.0
         gu, gv = t.get(g, (np.nan, np.nan))
         hm = np.zeros((H, W), np.float32)
@@ -245,8 +258,11 @@ def main():
     opt = torch.optim.Adam(model.parameters(), lr=1e-4)
     model.train()
     step = 0
-    n_epochs = 3 if sn else 12
+    n_epochs = 10 if sn else 12
     for epoch in range(n_epochs):
+        if epoch == 6:
+            for gp in opt.param_groups:
+                gp["lr"] = 3e-5
         losses = []
         for x, y in batches(samp, rng):
             x, y = x.to(device), y.to(device)
@@ -256,6 +272,8 @@ def main():
             losses.append(loss.item()); step += 1
         print(f"epoch {epoch}: loss {np.mean(losses):.4f} ({step} steps)",
               flush=True)
+        torch.save({"model_state_dict": model.state_dict(),
+                    "epoch": epoch}, "models/wasb_ft_epoch.pth")
     torch.save({"model_state_dict": model.state_dict()}, "models/wasb_ft.pth")
     print("saved models/wasb_ft.pth")
     evaluate(model, device)
