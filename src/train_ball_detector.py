@@ -137,6 +137,9 @@ def make_sample(clip, f, rng, negative=False):
     flip = rng.random() < 0.5
     gain = rng.uniform(0.8, 1.2)
     bias = rng.uniform(-20, 20)
+    # hue/saturation jitter: ball COLOR must not be a feature (wp1's yellow
+    # winter ball scored 1/17 against the white-ball-trained detector)
+    hue_shift = rng.integers(-25, 26) if rng.random() < 0.5 else 0
     # motion-blur augmentation: SoccerNet balls are mostly sharp; live-speed
     # free-kick balls are directional smears. Same kernel on all 3 frames.
     kblur = None
@@ -149,7 +152,12 @@ def make_sample(clip, f, rng, negative=False):
         kblur = cv2.warpAffine(kblur, M, (L, L))
         kblur /= max(kblur.sum(), 1e-6)
     for g, img in zip((f - 1, f, f + 1), imgs):
-        c = img[y0:y0 + H, x0:x0 + W].astype(np.float32)
+        c = img[y0:y0 + H, x0:x0 + W]
+        if hue_shift:
+            hsv = cv2.cvtColor(c, cv2.COLOR_BGR2HSV)
+            hsv[:, :, 0] = (hsv[:, :, 0].astype(int) + hue_shift) % 180
+            c = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+        c = c.astype(np.float32)
         if kblur is not None:
             c = cv2.filter2D(c, -1, kblur)
         c = np.clip(c * gain + bias, 0, 255)[:, :, ::-1] / 255.0

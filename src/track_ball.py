@@ -218,7 +218,7 @@ def associate(clip, poses_path, frames_dir=None, anchors=None):
         w.writerows(rows)
     cov = len(rows) / len(frames) * 100
     print(f"{len(rows)}/{len(frames)} frames on path ({cov:.0f}%) -> {out}")
-    if frames_dir:
+    if frames_dir and rows:
         tiles = []
         for f, u, v, _, _ in rows[::max(1, len(rows) // 20)]:
             img = cv2.imread(f"{frames_dir}/{f}.jpg")

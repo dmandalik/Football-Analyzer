@@ -371,6 +371,11 @@ def main():
                    metavar=("X", "Y"),
                    help="measured launch point [m] (e.g. from the resting-"
                         "ball pixel), overrides the first-observation ray")
+    f.add_argument("--noise", type=float, nargs=2, default=None,
+                   metavar=("CROSS", "ALONG"),
+                   help="explicit track noise [px] - the SG estimator "
+                        "needs dense even spacing and inflates wildly on "
+                        "sparse gap-heavy tracks")
     f.add_argument("--box", type=float, nargs=2, default=None,
                    metavar=("X", "Z"),
                    help="crossing box center [m], overriding pixel back-"
@@ -485,6 +490,8 @@ def main():
         box = (cx, cz, args.half)
 
         sc, sa, t_hat, n_hat = estimate_track_noise(uv)
+        if args.noise:
+            sc, sa = args.noise
         sc = float(np.hypot(sc, args.pose_noise))
         sa = float(np.hypot(sa, args.pose_noise))
         noise = (sc, sa, t_hat, n_hat)
