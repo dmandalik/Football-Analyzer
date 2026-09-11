@@ -10,3 +10,5 @@ models/*.pth.tar
 reports/*.npz
 third_party/
 data/soccernet_manifest.csv
+data/confusers.csv
+kaggle/labels_bundle/

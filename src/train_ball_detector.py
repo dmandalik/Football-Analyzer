@@ -87,6 +87,7 @@ def heatmap(u, v, sigma=SIGMA):
 
 
 SN_MANIFEST = "data/soccernet_manifest.csv"
+CONFUSERS = "data/confusers.csv"   # mined false positives: zero-target crops
 SN_SIGMA = 3.5   # SoccerNet ball labels carry 5-30 px jitter — soften targets
 
 
@@ -111,6 +112,35 @@ def sn_samples(stride=2):
     return out
 
 
+def confuser_samples():
+    """Proven false positives from our own clips: each becomes a crop
+    CONTAINING the confuser with an all-zero target."""
+    if not os.path.exists(CONFUSERS):
+        return []
+    out = []
+    for r in csv.DictReader(open(CONFUSERS)):
+        out.append((("cf", r["frames_dir"]),
+                    (int(r["frame"]), float(r["u"]), float(r["v"]))))
+    return out
+
+
+def make_confuser_sample(fdir, f, u, v, rng):
+    imgs = [cv2.imread(f"{fdir}/{g}.jpg") for g in (f - 1, f, f + 1)]
+    if any(i is None for i in imgs):
+        imgs = [i for i in imgs if i is not None] * 3
+    ih, iw = imgs[0].shape[:2]
+    x0 = int(np.clip(u - rng.integers(30, W - 30), 0, max(0, iw - W)))
+    y0 = int(np.clip(v - rng.integers(30, H - 30), 0, max(0, ih - H)))
+    xs = []
+    for img in imgs[:3]:
+        c = img[y0:y0 + H, x0:x0 + W].astype(np.float32)[:, :, ::-1] / 255.0
+        if c.shape[:2] != (H, W):
+            c = cv2.resize(c, (W, H))
+        xs.append(((c - MEAN) / STD).transpose(2, 0, 1))
+    return (np.concatenate(xs).astype(np.float32),
+            np.zeros((3, H, W), np.float32))
+
+
 def _resolve(clip):
     """-> (track dict, frames dir, filename fmt, target sigma)."""
     if isinstance(clip, tuple) and clip[0] == "sn":
@@ -124,15 +154,20 @@ def make_sample(clip, f, rng, negative=False):
     imgs = [cv2.imread(f"{fdir}/{fmt.format(g)}") for g in (f - 1, f, f + 1)]
     ih, iw = imgs[0].shape[:2]
     u, v = t[f]
+    # scale augmentation: far-camera balls are 4-8 px; native crops alone
+    # leave that out-of-distribution (the ronaldo gap). Zoom out by taking
+    # a larger crop and shrinking it, which shrinks the ball with it.
+    zoom = float(rng.uniform(1.5, 3.0)) if rng.random() < 0.4 else 1.0
+    cw, ch = min(int(W * zoom), iw), min(int(H * zoom), ih)
     if negative:   # crop that excludes the ball
         for _ in range(20):
-            x0 = rng.integers(0, max(1, iw - W))
-            y0 = rng.integers(0, max(1, ih - H))
-            if not (x0 - 20 < u < x0 + W + 20 and y0 - 20 < v < y0 + H + 20):
+            x0 = rng.integers(0, max(1, iw - cw))
+            y0 = rng.integers(0, max(1, ih - ch))
+            if not (x0 - 20 < u < x0 + cw + 20 and y0 - 20 < v < y0 + ch + 20):
                 break
     else:          # ball at a uniform random position inside the crop
-        x0 = int(np.clip(u - rng.integers(20, W - 20), 0, iw - W))
-        y0 = int(np.clip(v - rng.integers(20, H - 20), 0, ih - H))
+        x0 = int(np.clip(u - rng.integers(20, cw - 20), 0, iw - cw))
+        y0 = int(np.clip(v - rng.integers(20, ch - 20), 0, ih - ch))
     xs, ys_t = [], []
     flip = rng.random() < 0.5
     gain = rng.uniform(0.8, 1.2)
@@ -152,7 +187,9 @@ def make_sample(clip, f, rng, negative=False):
         kblur = cv2.warpAffine(kblur, M, (L, L))
         kblur /= max(kblur.sum(), 1e-6)
     for g, img in zip((f - 1, f, f + 1), imgs):
-        c = img[y0:y0 + H, x0:x0 + W]
+        c = img[y0:y0 + ch, x0:x0 + cw]
+        if zoom != 1.0:
+            c = cv2.resize(c, (W, H))
         if hue_shift:
             hsv = cv2.cvtColor(c, cv2.COLOR_BGR2HSV)
             hsv[:, :, 0] = (hsv[:, :, 0].astype(int) + hue_shift) % 180
@@ -163,8 +200,10 @@ def make_sample(clip, f, rng, negative=False):
         c = np.clip(c * gain + bias, 0, 255)[:, :, ::-1] / 255.0
         gu, gv = t.get(g, (np.nan, np.nan))
         hm = np.zeros((H, W), np.float32)
-        if not negative and np.isfinite(gu) and 0 <= gu - x0 < W and 0 <= gv - y0 < H:
-            hm = heatmap(gu - x0, gv - y0, sigma).astype(np.float32)
+        if (not negative and np.isfinite(gu)
+                and 0 <= gu - x0 < cw and 0 <= gv - y0 < ch):
+            hm = heatmap((gu - x0) * W / cw, (gv - y0) * H / ch,
+                         max(1.5, sigma / zoom)).astype(np.float32)
         if flip:
             c, hm = c[:, ::-1], hm[:, ::-1]
         xs.append(((c - MEAN) / STD).transpose(2, 0, 1))
@@ -182,7 +221,11 @@ def batches(samples, rng, bs=8, neg_frac=0.25):
         xs, ys = [], []
         for j in idx[i:i + bs]:
             clip, f = samples[j]
-            x, y = make_sample(clip, f, rng, negative=rng.random() < neg_frac)
+            if isinstance(clip, tuple) and clip[0] == "cf":
+                x, y = make_confuser_sample(clip[1], *f, rng)
+            else:
+                x, y = make_sample(clip, f, rng,
+                                   negative=rng.random() < neg_frac)
             xs.append(x), ys.append(y)
         yield (torch.from_numpy(np.stack(xs)), torch.from_numpy(np.stack(ys)))
 
@@ -259,9 +302,11 @@ def main():
     # train: SoccerNet corpus + our verified labels oversampled 8x
     ours = [s for c in CLIPS if c != HELD_OUT for s in triplets(c)]
     sn = sn_samples(stride=2) if os.path.exists(SN_MANIFEST) else []
-    samp = sn + ours * (8 if sn else 1)
+    cf = confuser_samples() * 2
+    samp = sn + ours * (8 if sn else 1) + cf
     print(f"finetuning on {len(samp)} samples "
-          f"({len(sn)} soccernet + {len(ours)}x8 ours; {HELD_OUT} held out), "
+          f"({len(sn)} sn + {len(ours)}x8 ours + {len(cf)} confusers; "
+          f"{HELD_OUT} held out), "
           f"{device}", flush=True)
     opt = torch.optim.Adam(model.parameters(), lr=1e-4)
     model.train()
