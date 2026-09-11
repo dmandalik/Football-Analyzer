@@ -119,7 +119,7 @@ def detect(clip, frames_dir, poses_path, first, last,
 
 
 # ------------------------------------------------------------- association
-def viterbi(frames, cands_g, conf):
+def viterbi(frames, cands_g, conf, anchor_frames=()):
     """DP over edges (t1,i)->(t2,j) with near-constant-acceleration cost.
     cands_g: goal-anchored candidate positions per frame index.
     Returns {frame: cand_index} for the best physically consistent path."""
@@ -130,6 +130,8 @@ def viterbi(frames, cands_g, conf):
             dt = fb - fa
             if dt > MAX_GAP:
                 break
+            if any(fa < af < fb for af in anchor_frames):
+                continue          # paths must land ON anchors, not skip them
             for i, pa in enumerate(cands_g[fa]):
                 for j, pb in enumerate(cands_g[fb]):
                     if np.isnan(pa[0]) or np.isnan(pb[0]):
@@ -160,8 +162,21 @@ def viterbi(frames, cands_g, conf):
                  + float(np.sum((acc - g) ** 2)) / A_SIG ** 2)
             if c < dp[k]:
                 dp[k], parent[k] = c, k2
-    # min total cost wins; rewards make long consistent paths negative
-    best = int(np.argmin(dp)) if len(dp) else None
+    # min total cost wins; rewards make long consistent paths negative.
+    # With anchors, only paths spanning first..last anchor are eligible.
+    def chain_span(k):
+        kk = k
+        while parent[kk] >= 0:
+            kk = parent[kk]
+        return edges[kk][0], edges[k][2]
+    best = None
+    for k in np.argsort(dp):
+        if anchor_frames:
+            s0, s1 = chain_span(int(k))
+            if s0 > min(anchor_frames) or s1 < max(anchor_frames):
+                continue
+        best = int(k)
+        break
     path = {}
     kk = best
     while kk is not None and kk >= 0:
@@ -172,7 +187,9 @@ def viterbi(frames, cands_g, conf):
     return path
 
 
-def associate(clip, poses_path, frames_dir=None):
+def associate(clip, poses_path, frames_dir=None, anchors=None):
+    """anchors: {frame: (u,v)} verified pixels — at those frames the
+    anchor becomes the only candidate (conf 1), pinning the path."""
     d = np.load(f"data/tracks/{clip}_candidates.npz")
     frames = [int(f) for f in d["frames"]]
     raw = d["cands"]
@@ -181,11 +198,18 @@ def associate(clip, poses_path, frames_dir=None):
     cands_g, conf, cands_px = {}, {}, {}
     for k, f in enumerate(frames):
         Hm = H(f, ref)
+        if anchors and f in anchors:
+            au, av = anchors[f]
+            cands_g[f] = [_warp(Hm, au, av)] + [(np.nan, np.nan)] * (K_PER_FRAME - 1)
+            conf[f] = [1.0] + [0.0] * (K_PER_FRAME - 1)
+            cands_px[f] = [(au, av)] * K_PER_FRAME
+            continue
         cands_g[f] = [(_warp(Hm, u, v) if np.isfinite(u) else (np.nan, np.nan))
                       for u, v, s in raw[k]]
         conf[f] = [s for _, _, s in raw[k]]
         cands_px[f] = [(u, v) for u, v, s in raw[k]]
-    path = viterbi(frames, cands_g, conf)
+    path = viterbi(frames, cands_g, conf,
+                   tuple(anchors) if anchors else ())
     rows = [(f, *cands_px[f][j], 0, 1) for f, j in sorted(path.items())]
     out = f"data/tracks/{clip}_auto.csv"
     with open(out, "w", newline="") as fh:
@@ -260,5 +284,10 @@ if __name__ == "__main__":
                int(sys.argv[5]), int(sys.argv[6]),
                *(sys.argv[7:8] or []))
     elif cmd == "associate":
+        anch = {}
+        for a in sys.argv[5:]:
+            fr, uv = a.split(":")
+            anch[int(fr)] = tuple(map(float, uv.split(",")))
         associate(sys.argv[2], sys.argv[3],
-                  sys.argv[4] if len(sys.argv) > 4 else None)
+                  sys.argv[4] if len(sys.argv) > 4 else None,
+                  anchors=anch or None)
